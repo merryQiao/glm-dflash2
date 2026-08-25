@@ -1,0 +1,31 @@
+{
+  "parquet_files": 141,
+  "rows": 630000,
+  "unique_ids": 630000,
+  "duplicate_ids": 0,
+  "empty_ids": 0,
+  "empty_prompts": 0,
+  "malformed_context_json": 0,
+  "normalization_errors": 0,
+  "dataset_repo": "cbyzju/vibe_coding_630k",
+  "dataset_revision": "d21155bcfc3dcc1433631500460c3f1cfd45f2be",
+  "dataset_fingerprint": "2b6b98b8f3d1061e9cf8e07ba239376ae2c960dac88993e7c53ae2d2e3edfc85",
+  "generation_input_routes": {
+    "context_json.incomplete_user_history+prompt": 28282,
+    "context_json.messages": 26510,
+    "context_json.static_context+prompt": 364763,
+    "context_json.truncated_messages_fallback_to_prompt": 26962,
+    "prompt": 183483
+  },
+  "category_rows": {
+    "coding_session_conversation": 15000,
+    "debug_test_fix": 125000,
+    "fullstack_app_engineering": 15000,
+    "greenfield_codegen": 50000,
+    "ml_ai_engineering": 100000,
+    "refactor_migration_perf": 75000,
+    "repo_feature": 150000,
+    "repo_understanding_planning": 50000,
+    "terminal_build_devops": 50000
+  }
+}

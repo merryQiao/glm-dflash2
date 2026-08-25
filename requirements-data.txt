@@ -1,0 +1,9 @@
+modelscope>=1.37,<2
+datasets>=3,<5
+numpy>=1.26,<3
+pyarrow>=16
+requests>=2.31,<3
+transformers>=4.57,<6
+
+# torch, torch-npu, SGLang and CANN must come from one vendor-tested Ascend
+# environment. Installing generic wheels here can break HCCL/NPU kernels.

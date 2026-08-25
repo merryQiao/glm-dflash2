@@ -1,0 +1,4 @@
+data/vibe_coding_630k/processed/
+outputs/
+*.pyc
+__pycache__/

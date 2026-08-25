@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from glm_dflash2.hidden_cache import PackedHiddenDataset
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cache-dir", type=Path, required=True)
+    parser.add_argument("--expected-samples", type=int)
+    parser.add_argument("--expected-layer-ids", default="1,20,38,56,75")
+    parser.add_argument("--full-scan", action="store_true")
+    parser.add_argument(
+        "--allow-building-cache",
+        action="store_true",
+        help="Validate a deliberately partial hardware-gate cache.",
+    )
+    parser.add_argument(
+        "--reference-pt",
+        type=Path,
+        help=(
+            "torch file with input_ids, hidden_states [T,L,H], and optional "
+            "layer_ids from an independent direct forward/hook"
+        ),
+    )
+    parser.add_argument("--atol", type=float, default=2e-2)
+    parser.add_argument("--rtol", type=float, default=2e-2)
+    args = parser.parse_args()
+    dataset = PackedHiddenDataset(
+        args.cache_dir,
+        require_frozen=not args.allow_building_cache,
+        verify_checksums=True,
+    )
+    expected_layers = tuple(int(value) for value in args.expected_layer_ids.split(","))
+    if dataset.spec.layer_ids != expected_layers:
+        raise ValueError(f"layer IDs {dataset.spec.layer_ids} != {expected_layers}")
+    if args.expected_samples is not None and len(dataset) != args.expected_samples:
+        raise ValueError(f"sample count {len(dataset)} != {args.expected_samples}")
+    indices = range(len(dataset)) if args.full_scan else range(min(1, len(dataset)))
+    tokens = 0
+    for index in indices:
+        row = dataset[index]
+        if not torch.isfinite(row["layer_hidden_states"].float()).all():
+            raise ValueError(f"sample {row['sample_id']} contains non-finite hidden states")
+        if row["input_ids"].numel() != row["loss_mask"].numel():
+            raise ValueError(f"sample {row['sample_id']} token/mask mismatch")
+        tokens += int(row["input_ids"].numel())
+    reference_status = "not_requested"
+    if args.reference_pt is not None:
+        if not len(dataset):
+            raise ValueError("cannot compare a reference against an empty cache")
+        reference = torch.load(args.reference_pt, map_location="cpu", weights_only=True)
+        row = dataset[0]
+        reference_ids = torch.as_tensor(reference["input_ids"], dtype=torch.int64).reshape(-1)
+        reference_hidden = torch.as_tensor(reference["hidden_states"]).to(torch.bfloat16)
+        if not torch.equal(row["input_ids"], reference_ids):
+            raise ValueError("reference input_ids differ from cache sample 0")
+        if tuple(reference_hidden.shape) != tuple(row["layer_hidden_states"].shape):
+            raise ValueError(
+                f"reference hidden shape {tuple(reference_hidden.shape)} differs from "
+                f"cache {tuple(row['layer_hidden_states'].shape)}"
+            )
+        if "layer_ids" in reference and tuple(reference["layer_ids"]) != dataset.spec.layer_ids:
+            raise ValueError("reference layer IDs differ from cache")
+        for layer_index, layer_id in enumerate(dataset.spec.layer_ids):
+            if not torch.allclose(
+                row["layer_hidden_states"][:, layer_index].float(),
+                reference_hidden[:, layer_index].float(),
+                atol=args.atol,
+                rtol=args.rtol,
+            ):
+                delta = (
+                    row["layer_hidden_states"][:, layer_index].float()
+                    - reference_hidden[:, layer_index].float()
+                ).abs().max()
+                raise ValueError(
+                    f"reference mismatch at logical layer {layer_id}: max_abs={delta.item()}"
+                )
+        reference_status = "matched_all_layers"
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "samples": len(dataset),
+                "checked_samples": len(list(indices)),
+                "checked_tokens": tokens,
+                "layers": list(dataset.spec.layer_ids),
+                "hidden_size": dataset.spec.hidden_size,
+                "reference": reference_status,
+            }
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

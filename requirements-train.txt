@@ -1,0 +1,6 @@
+# Runtime baseline: quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16.
+# Its bundled CANN 9.0 / PyTorch / torch-npu tuple is one indivisible vendor
+# stack. Do not install a generic PyPI torch wheel over it: that breaks HCCL.
+transformers==4.57.3
+safetensors>=0.4.5,<1
+numpy>=1.26,<3
