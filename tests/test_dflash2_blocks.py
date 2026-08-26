@@ -39,7 +39,7 @@ class DFlash2BlocksTest(unittest.TestCase):
         self.assertTrue(torch.equal(first, second))
 
     def test_sampling_has_hard_anchor_cap(self):
-        with self.assertRaisesRegex(ValueError, "at most 64"):
+        with self.assertRaisesRegex(ValueError, r"\[1, 64\]"):
             sample_anchor_positions(
                 torch.ones(1, 100, dtype=torch.bool),
                 block_size=4,
@@ -47,8 +47,8 @@ class DFlash2BlocksTest(unittest.TestCase):
                 generator=torch.Generator(),
             )
 
-    def test_no_valid_full_block_anchor_is_explicit(self):
-        mask = torch.tensor([[False, False, True, True]])
+    def test_no_valid_two_token_anchor_is_explicit(self):
+        mask = torch.tensor([[False, False, False, True]])
         with self.assertRaises(NoValidAnchorsError):
             sample_anchor_positions(
                 mask, block_size=4, num_anchors=2, generator=torch.Generator()
@@ -75,24 +75,24 @@ class DFlash2BlocksTest(unittest.TestCase):
             num_anchors=8,
             generator=torch.Generator().manual_seed(1),
         )
-        self.assertEqual(anchors[1][keep[1]].tolist(), [0, 1])
+        self.assertEqual(anchors[1][keep[1]].tolist(), [0, 1, 2, 3])
 
-    def test_builder_rejects_anchor_crossing_real_sequence_length(self):
+    def test_builder_rejects_anchor_without_real_successor(self):
         ids = torch.arange(16).reshape(2, 8)
         mask = torch.ones_like(ids, dtype=torch.bool)
         attention_mask = torch.tensor(
             [[True] * 8, [True] * 5 + [False] * 3], dtype=torch.bool
         )
-        with self.assertRaisesRegex(ValueError, "real sequence length"):
+        with self.assertRaisesRegex(ValueError, "in-range successor"):
             build_dflash_blocks(
                 ids,
                 mask,
-                torch.tensor([[0], [3]]),
+                torch.tensor([[0], [4]]),
                 torch.tensor([[True], [True]]),
                 attention_mask=attention_mask,
                 block_size=4,
                 mask_token_id=99,
-                sliding_window=8,
+                sliding_window=None,
             )
 
     def test_block_targets_are_unshifted_and_mask_positions_are_clean(self):
@@ -107,7 +107,7 @@ class DFlash2BlocksTest(unittest.TestCase):
             keep,
             block_size=4,
             mask_token_id=99,
-            sliding_window=5,
+            sliding_window=None,
         )
         self.assertEqual(blocks.noise_ids.tolist(), [[11, 99, 99, 99, 13, 99, 99, 99]])
         self.assertEqual(blocks.target_ids.tolist(), [[[11, 12, 13, 14], [13, 14, 15, 16]]])
@@ -117,7 +117,7 @@ class DFlash2BlocksTest(unittest.TestCase):
         )
         self.assertEqual(blocks.draft_position_ids.tolist(), [[1, 2, 3, 4, 3, 4, 5, 6]])
 
-    def test_attention_sees_strict_prefix_window_and_only_own_block(self):
+    def test_attention_sees_strict_full_prefix_and_only_own_block(self):
         ids = torch.arange(10).unsqueeze(0)
         loss_mask = torch.ones_like(ids, dtype=torch.bool)
         blocks = build_dflash_blocks(
@@ -127,15 +127,14 @@ class DFlash2BlocksTest(unittest.TestCase):
             torch.tensor([[True, True]]),
             block_size=2,
             mask_token_id=99,
-            sliding_window=3,
+            sliding_window=None,
         )
         visible = torch.isfinite(blocks.attention_mask[0, 0])
-        # Anchor 5, k=0: context j<5 and 5-j<3 -> {3,4}; own noise {10,11}.
-        self.assertEqual(visible[0].nonzero().flatten().tolist(), [3, 4, 10, 11])
-        # Same block k=1 has absolute position 6 -> only context j=4 remains.
-        self.assertEqual(visible[1].nonzero().flatten().tolist(), [4, 10, 11])
+        # Every local query sees the same strict prefix and both own slots.
+        self.assertEqual(visible[0].nonzero().flatten().tolist(), [0, 1, 2, 3, 4, 10, 11])
+        self.assertEqual(visible[1].nonzero().flatten().tolist(), [0, 1, 2, 3, 4, 10, 11])
         # Second block never sees the first block's noise slots.
-        self.assertEqual(visible[2].nonzero().flatten().tolist(), [4, 5, 12, 13])
+        self.assertEqual(visible[2].nonzero().flatten().tolist(), [0, 1, 2, 3, 4, 5, 12, 13])
 
 
 if __name__ == "__main__":
