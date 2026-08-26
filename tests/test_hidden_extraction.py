@@ -59,7 +59,16 @@ class HiddenExtractionTest(unittest.TestCase):
             + "\n"
         )
         path.with_suffix(path.suffix + ".manifest.json").write_text(
-            json.dumps({"status": status, "committed_ids": 1})
+            json.dumps(
+                {
+                    "status": status,
+                    "committed_ids": 1,
+                    "model_fingerprint": "model-fingerprint-test",
+                    "model_revision": "revision-test",
+                    "tokenizer_fingerprint": "tokenizer-fingerprint-test",
+                    "vocab_size": 154880,
+                }
+            )
         )
         return path
 
@@ -97,6 +106,13 @@ class HiddenExtractionTest(unittest.TestCase):
             self.assertEqual(provenance["logical_layer_ids"], [1, 20, 38, 56, 75])
             self.assertEqual(provenance["physical_layer_ids"], [2, 21, 39, 57, 76])
             self.assertEqual(len(provenance["capture_mapping"]), 5)
+            self.assertEqual(provenance["model_fingerprint"], "model-fingerprint-test")
+            self.assertEqual(provenance["model_revision"], "revision-test")
+            self.assertEqual(
+                provenance["tokenizer_fingerprint"], "tokenizer-fingerprint-test"
+            )
+            self.assertEqual(provenance["vocab_size"], 154880)
+            self.assertEqual(provenance["target_hidden_dtype"], "bfloat16")
 
     def test_max_samples_leaves_building_cache_that_can_resume(self):
         with tempfile.TemporaryDirectory() as tmp:

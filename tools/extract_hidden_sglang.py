@@ -30,6 +30,7 @@ from glm_dflash2.sglang_hidden_runner import (  # noqa: E402
     one_batch_module,
 )
 from glm_dflash2.provenance import local_model_fingerprint  # noqa: E402
+from glm_dflash2.target_io import model_revision, tokenizer_fingerprint  # noqa: E402
 
 
 def _sha256(path: Path) -> str:
@@ -58,7 +59,7 @@ def _worker(
     layer_ids: tuple[int, ...],
     max_segment_bytes: int,
     max_samples: int | None,
-    model_fingerprint: str,
+    target_identity: dict[str, Any],
     allow_partial_trajectories: bool,
     source_is_frozen: bool,
 ) -> None:
@@ -101,7 +102,8 @@ def _worker(
             "nccl_port": int(getattr(port_args, "nccl_port", 0)),
         },
         "model_path": str(Path(server_args.model_path).resolve()),
-        "model_fingerprint": model_fingerprint,
+        **target_identity,
+        "target_hidden_dtype": "bfloat16",
     }
     writer_context = (
         PackedHiddenWriter(
@@ -257,7 +259,15 @@ def main() -> int:
     ) is None:
         raise ValueError("frozen trajectory JSONL is empty")
     port_args = PortArgs.init_new(server_args)
-    model_fingerprint = local_model_fingerprint(Path(server_args.model_path))
+    model_path = Path(server_args.model_path)
+    model_fingerprint = local_model_fingerprint(model_path)
+    target_config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+    target_identity = {
+        "model_fingerprint": model_fingerprint,
+        "model_revision": model_revision(target_config, model_fingerprint),
+        "tokenizer_fingerprint": tokenizer_fingerprint(model_path),
+        "vocab_size": int(target_config["vocab_size"]),
+    }
     trajectory_manifest_path = trajectory_path.with_suffix(
         trajectory_path.suffix + ".manifest.json"
     )
@@ -268,6 +278,10 @@ def main() -> int:
         raise ValueError(
             "Stage B model fingerprint differs from the model used by Stage A"
         )
+    for key in ("model_revision", "tokenizer_fingerprint", "vocab_size"):
+        source_value = trajectory_manifest.get(key)
+        if source_value is not None and source_value != target_identity[key]:
+            raise ValueError(f"Stage B {key} differs from the model used by Stage A")
     if not cli.skip_storage_preflight:
         done = _done_ids(Path(cli.output_dir))
         remaining_tokens = 0
@@ -311,7 +325,7 @@ def main() -> int:
                 layer_ids,
                 max_segment_bytes,
                 cli.max_samples,
-                model_fingerprint,
+                target_identity,
                 cli.allow_partial_trajectories,
                 source_is_frozen,
             )
@@ -331,7 +345,7 @@ def main() -> int:
                             layer_ids,
                             max_segment_bytes,
                             cli.max_samples,
-                            model_fingerprint,
+                            target_identity,
                             cli.allow_partial_trajectories,
                             source_is_frozen,
                         ),

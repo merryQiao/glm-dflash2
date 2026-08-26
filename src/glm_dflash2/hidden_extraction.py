@@ -127,6 +127,11 @@ def extract_trajectory_cache(
         "physical_layer_ids": list(physical),
         "capture_mapping": [tap.as_tuple() for tap in runner.capture_mapping],
         "backend": dict(runner.backend_metadata),
+        "model_fingerprint": source_manifest.get("model_fingerprint"),
+        "model_revision": source_manifest.get("model_revision"),
+        "tokenizer_fingerprint": source_manifest.get("tokenizer_fingerprint"),
+        "vocab_size": source_manifest.get("vocab_size"),
+        "target_hidden_dtype": "bfloat16",
     }
     done = _existing_ids(output_dir)
     count = 0

@@ -25,7 +25,10 @@ _HEAD_KEYS = (
     "model.lm_head.weight",
     "output_layer.weight",
 )
+_HEAD_BIAS_SUFFIXES = ("lm_head.bias", "output_layer.bias")
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+_TARGET_IO_SCHEMA = "glm-drafter-target-io-v2"
+_IDENTITY_LOGIT_TRANSFORM = "identity"
 
 
 def _sha256(path: Path) -> str:
@@ -36,7 +39,8 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _tokenizer_fingerprint(model_dir: Path) -> str:
+def tokenizer_fingerprint(model_dir: str | Path) -> str:
+    model_dir = Path(model_dir)
     names = ("tokenizer_config.json", "tokenizer.json", "tokenizer.model", "special_tokens_map.json")
     digest = hashlib.sha256()
     found = False
@@ -50,6 +54,39 @@ def _tokenizer_fingerprint(model_dir: Path) -> str:
     if not found:
         raise FileNotFoundError(f"no tokenizer artifacts found under {model_dir}")
     return digest.hexdigest()
+
+
+def model_revision(config: Mapping[str, Any], model_fingerprint: str) -> str:
+    for key in ("_commit_hash", "revision", "model_revision"):
+        value = config.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # A local checkpoint need not carry a Hub commit.  Its immutable local
+    # fingerprint is the only revision identity that is still reproducible.
+    return model_fingerprint
+
+
+def _tensor_sha256(value: torch.Tensor) -> str:
+    raw = value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _validate_identity_logit_transform(
+    config: Mapping[str, Any], weight_mapping: Mapping[str, str]
+) -> None:
+    bias_keys = [
+        key for key in weight_mapping if any(key.endswith(suffix) for suffix in _HEAD_BIAS_SUFFIXES)
+    ]
+    if bias_keys:
+        raise ValueError(f"lm_head bias is unsupported by identity reconstruction: {bias_keys}")
+    for key in ("logit_scale", "output_logits_scale", "logits_scaling"):
+        value = config.get(key)
+        if value is not None and float(value) != 1.0:
+            raise ValueError(f"unsupported non-identity {key}={value}")
+    for key in ("final_logit_softcapping", "logits_soft_cap", "logit_softcap"):
+        value = config.get(key)
+        if value is not None and float(value) != 0.0:
+            raise ValueError(f"unsupported logit softcap {key}={value}")
 
 
 def _weight_map(model_dir: Path) -> dict[str, str]:
@@ -103,6 +140,7 @@ def extract_target_io(
     *,
     embed_key: str | None = None,
     lm_head_key: str | None = None,
+    expected_hidden_size: int = 6144,
 ) -> dict[str, Any]:
     """Copy only dense token embedding and LM-head tensors from a GLM checkpoint."""
 
@@ -114,7 +152,12 @@ def extract_target_io(
     config = json.loads(config_path.read_text(encoding="utf-8"))
     hidden_size = int(config["hidden_size"])
     vocab_size = int(config["vocab_size"])
+    if hidden_size != int(expected_hidden_size):
+        raise ValueError(
+            f"target hidden shape width must be {int(expected_hidden_size)}, got {hidden_size}"
+        )
     mapping = _weight_map(model_dir)
+    _validate_identity_logit_transform(config, mapping)
     resolved_embed = _resolve_key(mapping, _EMBED_KEYS, embed_key, "embed_tokens")
     try:
         resolved_head = _resolve_key(mapping, _HEAD_KEYS, lm_head_key, "lm_head")
@@ -145,18 +188,36 @@ def extract_target_io(
         },
         weight_path,
     )
+    source_model_fingerprint = local_model_fingerprint(model_dir)
     manifest: dict[str, Any] = {
-        "schema": "glm-dflash2-target-io-v1",
+        "schema": _TARGET_IO_SCHEMA,
         "source_model_dir": str(model_dir),
-        "source_model_fingerprint": local_model_fingerprint(model_dir),
+        "source_model_fingerprint": source_model_fingerprint,
+        "model_revision": model_revision(config, source_model_fingerprint),
         "config_sha256": _sha256(config_path),
-        "tokenizer_fingerprint": _tokenizer_fingerprint(model_dir),
+        "tokenizer_fingerprint": tokenizer_fingerprint(model_dir),
         "model_type": str(config.get("model_type", "")),
         "vocab_size": vocab_size,
         "hidden_size": hidden_size,
         "tie_word_embeddings": bool(config.get("tie_word_embeddings", False)),
         "source_keys": {"embed_tokens": resolved_embed, "lm_head": resolved_head},
         "source_dtypes": {"embed_tokens": str(embed.dtype), "lm_head": str(head.dtype)},
+        "tensors": {
+            "embed_tokens": {
+                "key": "embed_tokens.weight",
+                "shape": list(embed.shape),
+                "dtype": str(embed.dtype),
+                "sha256": _tensor_sha256(embed),
+            },
+            "lm_head": {
+                "key": "lm_head.weight",
+                "shape": list(head.shape),
+                "dtype": str(head.dtype),
+                "sha256": _tensor_sha256(head),
+            },
+        },
+        "lm_head_bias": False,
+        "logit_transform": _IDENTITY_LOGIT_TRANSFORM,
         "weights_file": weight_path.name,
         "weights_sha256": _sha256(weight_path),
     }
@@ -184,14 +245,32 @@ def load_frozen_target_io(
     if not manifest_path.is_file():
         raise FileNotFoundError(f"missing target I/O manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != "glm-dflash2-target-io-v1":
+    if manifest.get("schema") != _TARGET_IO_SCHEMA:
         raise ValueError("unsupported target I/O manifest schema")
+    if manifest.get("logit_transform") != _IDENTITY_LOGIT_TRANSFORM:
+        raise ValueError("unsupported target I/O logit transform")
+    if manifest.get("lm_head_bias") is not False:
+        raise ValueError("target I/O lm_head bias is unsupported")
     weight_path = output_dir / str(manifest["weights_file"])
     if _sha256(weight_path) != manifest.get("weights_sha256"):
         raise ValueError("target I/O weights checksum mismatch")
     tensors = load_file(weight_path, device="cpu")
     embed_weight = tensors["embed_tokens.weight"].to(device=device, dtype=dtype)
     head_weight = tensors["lm_head.weight"].to(device=device, dtype=dtype)
+    source_tensors = {
+        "embed_tokens": tensors["embed_tokens.weight"],
+        "lm_head": tensors["lm_head.weight"],
+    }
+    expected_shape = [int(manifest["vocab_size"]), int(manifest["hidden_size"])]
+    tensor_manifest = manifest.get("tensors") or {}
+    for name, value in source_tensors.items():
+        metadata = tensor_manifest.get(name) or {}
+        if metadata.get("shape") != expected_shape or list(value.shape) != expected_shape:
+            raise ValueError(f"target I/O {name} shape mismatch")
+        if metadata.get("dtype") != str(value.dtype):
+            raise ValueError(f"target I/O {name} dtype mismatch")
+        if metadata.get("sha256") != _tensor_sha256(value):
+            raise ValueError(f"target I/O {name} content checksum mismatch")
     embed = nn.Embedding.from_pretrained(embed_weight, freeze=True)
     # Construct on meta and adopt the loaded tensor directly.  A normal Linear
     # constructor followed by copy would transiently allocate a second full
@@ -216,6 +295,12 @@ def validate_cache_io_compatibility(
 ) -> None:
     spec = cache_manifest.get("spec") or {}
     provenance = cache_manifest.get("provenance") or {}
+    if io_manifest.get("schema") != _TARGET_IO_SCHEMA:
+        raise ValueError("aligned training requires target I/O schema v2")
+    if io_manifest.get("logit_transform") != _IDENTITY_LOGIT_TRANSFORM:
+        raise ValueError("target I/O logit transform is not identity")
+    if io_manifest.get("lm_head_bias") is not False:
+        raise ValueError("target I/O lm_head bias is unsupported")
     if provenance.get("model_fingerprint") != io_manifest.get("source_model_fingerprint"):
         raise ValueError("cache and target I/O model fingerprint differ")
     logical = tuple(int(value) for value in spec.get("layer_ids", ()))
@@ -224,7 +309,25 @@ def validate_cache_io_compatibility(
         raise ValueError(
             f"cache logical layer order must be {expected_layer_ids}, got spec={logical}, provenance={recorded_logical}"
         )
+    if int(spec.get("schema_version", -1)) != 2:
+        raise ValueError("aligned training requires hidden cache schema v2")
+    if spec.get("final_hidden_semantics") != "post_final_norm_lm_head_input":
+        raise ValueError("cache final hidden is not the LM-head input")
     if int(spec.get("hidden_size", -1)) != int(io_manifest.get("hidden_size", -2)):
         raise ValueError("cache hidden size differs from target I/O hidden size")
     if spec.get("dtype") != "bfloat16" or spec.get("mask_semantics") != "dflash_target_token":
         raise ValueError("cache dtype or mask semantics are incompatible with DFlash2 training")
+    for cache_key, io_key, label in (
+        ("model_revision", "model_revision", "model revision"),
+        ("tokenizer_fingerprint", "tokenizer_fingerprint", "tokenizer fingerprint"),
+        ("vocab_size", "vocab_size", "vocabulary size"),
+    ):
+        if provenance.get(cache_key) != io_manifest.get(io_key):
+            raise ValueError(f"cache and target I/O {label} differ")
+    if provenance.get("target_hidden_dtype") != "bfloat16":
+        raise ValueError("cache target hidden dtype must be bfloat16")
+    source_dtypes = io_manifest.get("source_dtypes") or {}
+    if source_dtypes.get("embed_tokens") != "torch.bfloat16" or source_dtypes.get(
+        "lm_head"
+    ) != "torch.bfloat16":
+        raise ValueError("target I/O source tensors must both be bfloat16")
