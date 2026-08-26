@@ -1,0 +1,222 @@
+from __future__ import annotations
+
+import json
+import math
+import re
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+
+_COUNTERS = {
+    "vllm:spec_decode_num_drafts_total": "num_drafts",
+    "vllm:spec_decode_num_draft_tokens_total": "num_draft_tokens",
+    "vllm:spec_decode_num_accepted_tokens_total": "num_accepted_tokens",
+}
+_SAMPLE = re.compile(r"^(?P<name>[^\s{]+)(?:\{[^}]*\})?\s+(?P<value>[-+0-9.eE]+)(?:\s+\d+)?$")
+
+
+def parse_spec_decode_metrics(text: str) -> dict[str, float]:
+    result = {name: 0.0 for name in _COUNTERS.values()}
+    found: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _SAMPLE.match(line)
+        if match is None:
+            continue
+        output_name = _COUNTERS.get(match.group("name"))
+        if output_name is None:
+            continue
+        value = float(match.group("value"))
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite Prometheus counter {match.group('name')}")
+        result[output_name] += value
+        found.add(output_name)
+    if found and found != set(result):
+        missing = sorted(set(result) - found)
+        raise ValueError(f"incomplete speculative-decoding metrics: missing {missing}")
+    return result if found else {}
+
+
+def summarize_spec_decode(
+    before: Mapping[str, float], after: Mapping[str, float]
+) -> dict[str, float]:
+    names = ("num_drafts", "num_draft_tokens", "num_accepted_tokens")
+    delta = {name: float(after[name]) - float(before[name]) for name in names}
+    if any(value < 0 for value in delta.values()):
+        raise ValueError("speculative-decoding counters decreased during the run")
+    drafts = delta["num_drafts"]
+    drafted = delta["num_draft_tokens"]
+    accepted = delta["num_accepted_tokens"]
+    if drafts <= 0 or drafted <= 0:
+        raise ValueError("the server reported no speculative draft steps")
+    return {
+        "drafts": drafts,
+        "draft_tokens": drafted,
+        "accepted_tokens": accepted,
+        # vLLM convention includes the verifier bonus token.
+        "mean_acceptance_length": 1.0 + accepted / drafts,
+        "draft_acceptance_rate": accepted / drafted,
+    }
+
+
+def _read_json(url: str, payload: Mapping[str, Any], timeout: float) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _read_text(url: str, timeout: float) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
+
+def load_prompts(path: str | Path, *, max_samples: int = 0) -> list[dict[str, Any]]:
+    prompts: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for index, raw in enumerate(handle):
+            if max_samples > 0 and len(prompts) >= max_samples:
+                break
+            if not raw.strip():
+                continue
+            row = json.loads(raw)
+            sample_id = str(row.get("id", row.get("sample_id", index)))
+            if isinstance(row.get("messages"), list):
+                prompts.append({"sample_id": sample_id, "messages": row["messages"]})
+            elif isinstance(row.get("prompt"), str):
+                prompts.append({"sample_id": sample_id, "prompt": row["prompt"]})
+            else:
+                raise ValueError(f"row {index} must contain messages or prompt")
+    if not prompts:
+        raise ValueError("prompt file is empty")
+    return prompts
+
+
+def benchmark_openai_server(
+    *,
+    base_url: str,
+    model: str,
+    prompts: Sequence[Mapping[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    seed: int,
+    warmup_requests: int = 2,
+    timeout: float = 1800.0,
+) -> dict[str, Any]:
+    if max_tokens < 1 or warmup_requests < 0:
+        raise ValueError("max_tokens must be positive and warmup_requests non-negative")
+    base_url = base_url.rstrip("/")
+
+    def request_one(row: Mapping[str, Any], request_seed: int) -> tuple[dict[str, Any], float]:
+        is_chat = "messages" in row
+        endpoint = "/v1/chat/completions" if is_chat else "/v1/completions"
+        payload: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "seed": request_seed,
+            "stream": False,
+        }
+        payload["messages" if is_chat else "prompt"] = row["messages" if is_chat else "prompt"]
+        started = time.perf_counter()
+        response = _read_json(base_url + endpoint, payload, timeout)
+        return response, time.perf_counter() - started
+
+    for index in range(warmup_requests):
+        request_one(prompts[index % len(prompts)], seed + index)
+    before = parse_spec_decode_metrics(_read_text(base_url + "/metrics", timeout))
+    samples: list[dict[str, Any]] = []
+    started = time.perf_counter()
+    for index, row in enumerate(prompts):
+        response, latency = request_one(row, seed + index)
+        if response.get("error"):
+            raise RuntimeError(f"vLLM request failed: {response['error']}")
+        usage = response.get("usage") or {}
+        completion_tokens = usage.get("completion_tokens")
+        if completion_tokens is None:
+            raise ValueError("vLLM response is missing usage.completion_tokens")
+        choice = (response.get("choices") or [{}])[0]
+        output = (
+            (choice.get("message") or {}).get("content", "")
+            if "messages" in row
+            else choice.get("text", "")
+        )
+        samples.append(
+            {
+                "sample_id": str(row["sample_id"]),
+                "completion_tokens": int(completion_tokens),
+                "latency_seconds": latency,
+                "output_text": str(output or ""),
+            }
+        )
+    wall = time.perf_counter() - started
+    after = parse_spec_decode_metrics(_read_text(base_url + "/metrics", timeout))
+    completion_tokens = sum(item["completion_tokens"] for item in samples)
+    result: dict[str, Any] = {
+        "schema": "glm-vllm-ascend-benchmark-v1",
+        "server": base_url,
+        "model": model,
+        "sampling": {
+            "temperature": temperature,
+            "top_p": top_p,
+            "seed": seed,
+            "max_tokens": max_tokens,
+        },
+        "summary": {
+            "samples": len(samples),
+            "completion_tokens": completion_tokens,
+            "wall_seconds": wall,
+            "tps": completion_tokens / wall if wall > 0 else float("nan"),
+            "mean_request_latency_seconds": sum(item["latency_seconds"] for item in samples) / len(samples),
+        },
+        "samples": samples,
+    }
+    if before and after:
+        result["spec_decode"] = summarize_spec_decode(before, after)
+    return result
+
+
+def compare_benchmark_results(
+    baseline: Mapping[str, Any],
+    speculative: Mapping[str, Any],
+    *,
+    require_exact_outputs: bool,
+) -> dict[str, Any]:
+    baseline_samples = {str(row["sample_id"]): row for row in baseline["samples"]}
+    speculative_samples = {str(row["sample_id"]): row for row in speculative["samples"]}
+    if baseline_samples.keys() != speculative_samples.keys():
+        raise ValueError("baseline and speculative sample sets differ")
+    matches = [
+        baseline_samples[key]["output_text"] == speculative_samples[key]["output_text"]
+        for key in baseline_samples
+    ]
+    exact = all(matches)
+    if require_exact_outputs and not exact:
+        mismatched = sum(not value for value in matches)
+        raise ValueError(f"lossless greedy parity failed for {mismatched} samples")
+    baseline_tps = float(baseline["summary"]["tps"])
+    speculative_tps = float(speculative["summary"]["tps"])
+    if baseline_tps <= 0:
+        raise ValueError("baseline TPS must be positive")
+    spec_decode = dict(speculative.get("spec_decode") or {})
+    return {
+        "schema": "glm-vllm-ascend-comparison-v1",
+        "baseline_tps": baseline_tps,
+        "speculative_tps": speculative_tps,
+        "speedup": speculative_tps / baseline_tps,
+        "exact_output_match": exact,
+        "exact_output_match_rate": sum(matches) / len(matches),
+        "mean_acceptance_length": spec_decode.get("mean_acceptance_length"),
+        "draft_acceptance_rate": spec_decode.get("draft_acceptance_rate"),
+        "drafts": spec_decode.get("drafts"),
+    }
