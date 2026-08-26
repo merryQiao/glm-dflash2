@@ -54,7 +54,7 @@ class DSparkObjectiveTest(unittest.TestCase):
             all(call.args[0].dtype == call.args[1].dtype == torch.bfloat16 for call in matrix_multiply.call_args_list)
         )
 
-    def test_full_vocab_l1_confidence_and_total_match_dense_reference(self):
+    def test_full_vocab_tv_confidence_and_total_match_dense_reference(self):
         draft, teacher, weight, markov = self._fixture()
         target_ids = torch.tensor([[[2, 4]]])
         predecessors = torch.tensor([[[1, 2]]])
@@ -82,8 +82,8 @@ class DSparkObjectiveTest(unittest.TestCase):
         dense_teacher = torch.mm(flat_teacher, weight.T).float()
         q = dense_draft.softmax(-1)
         p = dense_teacher.softmax(-1)
-        expected_l1 = (q - p).abs().sum(-1).reshape_as(target_ids)
-        expected_confidence_target = (1.0 - 0.5 * expected_l1).clamp(0.0, 1.0)
+        expected_tv = 0.5 * (q - p).abs().sum(-1).reshape_as(target_ids)
+        expected_confidence_target = (1.0 - expected_tv).clamp(0.0, 1.0)
         expected_ce = F.cross_entropy(
             dense_draft, target_ids.reshape(-1), reduction="none"
         ).reshape_as(target_ids)
@@ -94,10 +94,10 @@ class DSparkObjectiveTest(unittest.TestCase):
         )
         expected_total = (
             0.1 * weighted(expected_ce)
-            + 0.9 * weighted(expected_l1)
+            + 0.9 * weighted(expected_tv)
             + weighted(expected_confidence)
         )
-        torch.testing.assert_close(result.l1_per_token, expected_l1, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(result.tv_per_token, expected_tv, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(
             result.confidence_target, expected_confidence_target, atol=1e-6, rtol=1e-6
         )

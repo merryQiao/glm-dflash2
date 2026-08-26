@@ -251,7 +251,7 @@ Run focused tests and commit as `feat: add aligned DFlash and DFlash2 trainers`.
 
 - [ ] **Step 1: Write failing DSpark tests**
 
-Use tiny vocab fixtures to assert: target token at `a+d+1` uses final hidden at `a+d`; frozen LM-head reconstruction equals dense logits; Markov bias is applied before draft softmax; full-vocab FP32 L1 equals the dense reference; confidence target is `clamp(1 - 0.5*L1, 0, 1)` and detached; and total loss is `0.1 CE + 0.9 L1 + 1.0 BCE` with common depth weights.
+Use tiny vocab fixtures to assert: target token at `a+d+1` uses final hidden at `a+d`; frozen LM-head reconstruction equals dense logits; Markov bias is applied before draft softmax; full-vocab FP32 TV equals `0.5*L1`; confidence target is `clamp(1 - TV, 0, 1)` and detached; and total loss is `0.1 CE + 0.9 TV + 1.0 BCE` with common depth weights.
 
 Assert DSpark predecessor IDs use the clean anchor at depth 0 and the
 teacher-forced previous target thereafter. Instrument dtype flow to prove the
@@ -264,7 +264,7 @@ Run the three new test modules and require import/behavior failures.
 
 - [ ] **Step 3: Implement DSpark modules and exact chunked distribution loss**
 
-Implement the low-rank Markov head and confidence head on the common backbone. Reconstruct target logits from `target_final_hidden[a+d] @ lm_head.T`; compute numerically exact full-vocabulary softmax/L1 in bounded chunks using FP32 log-sum-exp passes, without top-k approximation.
+Implement the low-rank Markov head and confidence head on the common backbone. Reconstruct target logits from `target_final_hidden[a+d] @ lm_head.T`; compute numerically exact full-vocabulary softmax/TV in bounded chunks using FP32 log-sum-exp passes, without top-k approximation.
 
 - [ ] **Step 4: Add `OfflineDSparkTrainer` and strict v2 requirement**
 

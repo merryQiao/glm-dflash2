@@ -32,9 +32,11 @@ commands and hardware gates.
    streams and post-final-norm LM-head input together.
 3. **Target token I/O extraction.** Dense BF16/FP16/FP32
    `embed_tokens.weight` and `lm_head.weight` are extracted once and frozen.
-4. **Offline training.** All methods use the same cache rows, stable sample IDs,
-   deterministic anchors, common backbone, optimizer/checkpoint framework and
-   absolute-position contract.
+4. **Offline training and deployment export.** All methods use the same cache
+   rows, stable sample IDs, deterministic anchors, common backbone,
+   optimizer/checkpoint framework and absolute-position contract. The final
+   `export/` combines the trained draft with the frozen target embedding and
+   LM head required by a serving runtime.
 
 Stage A and Stage B intentionally run separately so two 753B target replicas
 are never resident simultaneously. The frozen sampled path is teacher-forced;
@@ -77,16 +79,17 @@ about 46.4 TB, so storage planning is mandatory.
   Markov head `Embedding(V,256) -> Linear(256,V)` and a Markov-aware confidence
   head. Target distributions are reconstructed from
   `target_final_hidden @ frozen_lm_head.T`; its exact chunked loss is
-  `0.1*CE + 0.9*full_vocab_L1 + 1.0*BCE`.
+  `0.1*CE + 0.9*TV + 1.0*BCE`, where
+  `TV=0.5*sum_v|p_target(v)-p_draft(v)|`.
 
 For DSpark, target token position `p` uses final hidden position `p-1`. At
 depth zero the predecessor is the clean anchor; later depths use the
 teacher-forced previous target. The LM-head matmul stays BF16 and logits/loss
 normalization use FP32.
 
-The DSpark confidence soft target is `1 - 0.5 * full_vocab_L1`; the unified
+The DSpark confidence soft target is `1 - TV`; the unified
 GLM-5.2 five-layer recipe is three epochs, learning rate `6e-4`, gamma 4, and loss
-`0.1*CE + 0.9*L1 + 1.0*confidence_BCE`. DFlash/DFlash2 retain three epochs
+`0.1*CE + 0.9*TV + 1.0*confidence_BCE`. DFlash/DFlash2 retain three epochs
 and learning rate `6e-4`; gamma is 4 for B8 and 7 for B16.
 
 ## Quick local verification
@@ -227,6 +230,45 @@ Set `METHOD=dflash`, `dflash2`, or `dspark`. DFlash/DFlash2 accept
 `NNODES`, `NODE_RANK`, `MASTER_ADDR`, and `MASTER_PORT`. The deprecated
 `train_glm52_dflash2_910b.sh` is only a compatibility wrapper.
 
+Every successful training run writes a resumable `step-N/` training checkpoint
+and one deployment artifact under `export/`:
+
+```text
+export/
+  config.json
+  config.py
+  model.safetensors       # draft + frozen embed_tokens + frozen lm_head
+  export_manifest.json    # checksums, target identity, runtime compatibility
+```
+
+The exported proposal count is `block_size - 1`: the physical block's first
+position is the known anchor and is never sampled. DFlash and DSpark exports
+use the public Speculators key/config contract. DFlash2 is exported exactly for
+round-trip and provenance, but is explicitly marked
+`custom-vllm-ascend-adapter-required`; stock vLLM-Ascend must not load it as
+ordinary DFlash.
+
+Run a target-only versus speculative benchmark sequentially on the same 910B
+devices:
+
+```bash
+TARGET_MODEL=/shared/models/GLM-5.2-bf16 \
+DRAFTER_EXPORT=/shared/out/glm52-dspark/export \
+PROMPTS_JSONL=/shared/eval/fixed-prompts.jsonl \
+OUT_DIR=/shared/eval/glm52-dspark-b8 \
+TP_SIZE=16 MAX_SAMPLES=100 MAX_TOKENS=2048 \
+bash scripts/eval_vllm_ascend.sh
+```
+
+The launcher does not co-locate the baseline and speculative servers. It reads
+vLLM's `spec_decode_num_drafts`, `spec_decode_num_draft_tokens`, and
+`spec_decode_num_accepted_tokens` Prometheus counters. Mean acceptance length
+uses vLLM's bonus-inclusive convention
+`1 + accepted_tokens / drafts`; TPS is actual completion tokens divided by
+wall time. Greedy evaluation requires exact target-only/speculative output
+parity. Block Verify and Entropy Verify are intentionally not enabled because
+they can change output tokens.
+
 ## Numerical hidden-capture gate
 
 Before producing the full cache, collect three independent direct-forward
@@ -258,10 +300,12 @@ python tools/validate_hidden_cache.py \
 
 ## Explicit limits
 
-- The real 910B hidden parity, two-rank FSDP2 resume, and serving ABI gates must
-  still be run on the actual CANN/torch-npu/SGLang deployment stack.
-- The repository does not claim a final Ascend speculative-decoding runtime.
-  Export parity must compare method-specific logits/heads in the serving fork.
+- The real 910B hidden parity, two-rank FSDP2 resume, export load, and serving
+  ABI gates must still be run on the actual CANN/torch-npu/SGLang/vLLM-Ascend
+  deployment stack.
+- Stock vLLM-Ascend serving is wired only for DFlash and DSpark. DFlash2 still
+  needs a method-specific proposer adapter and is blocked by the benchmark
+  launcher until that adapter exists.
 - `MASK_TOKEN_ID` is mandatory and must come from the actual tokenizer/runtime;
   EOS or PAD must not be substituted.
 - Quantized target token-I/O artifacts, mismatched model revisions, ambiguous

@@ -65,7 +65,7 @@ class _PreparedHidden:
 class OfflineDSparkStepOutput:
     loss: torch.Tensor
     ce_loss: torch.Tensor
-    l1_loss: torch.Tensor
+    tv_loss: torch.Tensor
     confidence_loss: torch.Tensor
     accuracy: torch.Tensor
     accept_len: torch.Tensor
@@ -74,8 +74,8 @@ class OfflineDSparkStepOutput:
     loss_weight: torch.Tensor
     ce_numerator: torch.Tensor
     ce_denominator: torch.Tensor
-    l1_numerator: torch.Tensor
-    l1_denominator: torch.Tensor
+    tv_numerator: torch.Tensor
+    tv_denominator: torch.Tensor
     confidence_numerator: torch.Tensor
     confidence_denominator: torch.Tensor
     correct: torch.Tensor
@@ -452,7 +452,7 @@ class OfflineDSparkTrainer(_OfflineDFlashBase):
         self,
         *args: Any,
         ce_weight: float = 0.1,
-        l1_weight: float = 0.9,
+        tv_weight: float = 0.9,
         confidence_weight: float = 1.0,
         **kwargs: Any,
     ) -> None:
@@ -463,7 +463,7 @@ class OfflineDSparkTrainer(_OfflineDFlashBase):
         if not isinstance(self.draft_model, DSparkDraftModel):
             raise TypeError("OfflineDSparkTrainer requires DSparkDraftModel")
         self.ce_weight = float(ce_weight)
-        self.l1_weight = float(l1_weight)
+        self.tv_weight = float(tv_weight)
         self.confidence_weight = float(confidence_weight)
 
     def forward(
@@ -505,17 +505,17 @@ class OfflineDSparkTrainer(_OfflineDFlashBase):
             gamma=self.gamma,
             vocab_chunk_size=self.vocab_chunk_size,
             ce_weight=self.ce_weight,
-            l1_weight=self.l1_weight,
+            tv_weight=self.tv_weight,
             confidence_weight=self.confidence_weight,
         )
         ce_loss = global_weighted_mean(losses.ce.mean, losses.ce.denominator)
-        l1_loss = global_weighted_mean(losses.l1.mean, losses.l1.denominator)
+        tv_loss = global_weighted_mean(losses.tv.mean, losses.tv.denominator)
         confidence_loss = global_weighted_mean(
             losses.confidence.mean, losses.confidence.denominator
         )
         total = (
             self.ce_weight * ce_loss
-            + self.l1_weight * l1_loss
+            + self.tv_weight * tv_loss
             + self.confidence_weight * confidence_loss
         )
         valid = prepared.pred_mask.to(torch.bool)
@@ -528,7 +528,7 @@ class OfflineDSparkTrainer(_OfflineDFlashBase):
         return OfflineDSparkStepOutput(
             loss=total,
             ce_loss=ce_loss.detach(),
-            l1_loss=l1_loss.detach(),
+            tv_loss=tv_loss.detach(),
             confidence_loss=confidence_loss.detach(),
             accuracy=accuracy.detach(),
             accept_len=accept_len.detach(),
@@ -537,8 +537,8 @@ class OfflineDSparkTrainer(_OfflineDFlashBase):
             loss_weight=losses.ce.denominator.detach(),
             ce_numerator=losses.ce.numerator.detach(),
             ce_denominator=losses.ce.denominator.detach(),
-            l1_numerator=losses.l1.numerator.detach(),
-            l1_denominator=losses.l1.denominator.detach(),
+            tv_numerator=losses.tv.numerator.detach(),
+            tv_denominator=losses.tv.denominator.detach(),
             confidence_numerator=losses.confidence.numerator.detach(),
             confidence_denominator=losses.confidence.denominator.detach(),
             correct=correct.detach(),

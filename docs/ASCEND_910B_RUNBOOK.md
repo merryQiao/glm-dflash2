@@ -118,13 +118,20 @@ Use `METHOD=dflash`, `dflash2`, or `dspark`. DFlash and DFlash2 support
 `BLOCK_SIZE=8` and `16`; run both settings separately. DSpark supports only
 `BLOCK_SIZE=8`, whose layout is one anchor plus seven proposed tokens. Its
 default recipe is three epochs, `lr=6e-4`, gamma 4, rank-256 vanilla Markov,
-Markov-aware confidence, and `0.1 CE + 0.9 full-vocab L1 + 1.0 BCE`.
+Markov-aware confidence, and `0.1 CE + 0.9 TV + 1.0 BCE`, where
+`TV=0.5*sum_v|p_target(v)-p_draft(v)|`.
 For DFlash and DFlash2, B8 also uses gamma 4 while B16 uses gamma 7.
 For multiple nodes, use identical
 arguments and set `NODE_RANK` uniquely. Resume only from a `COMPLETE` step and
 do not change cache identity, method, architecture, optimizer or scheduler.
 
-## 8. Serving ABI gate
+## 8. Export and serving ABI gate
+
+Training writes `OUTPUT_DIR/export`. Unlike the resumable training checkpoint,
+this deployment artifact contains the trained draft plus frozen target
+`embed_tokens.weight` and `lm_head.weight`. Verify all hashes in
+`export_manifest.json` before loading it. Its config fixes
+`sample_from_anchor=false`, so B8/B16 request 7/15 speculative tokens.
 
 Load the exported draft in the exact Ascend serving fork and compare a fixed
 batch against offline training with the same token IDs, anchors, positions and
@@ -134,8 +141,34 @@ cache fingerprint:
 - DFlash2: top-16 candidate IDs/scores and selector scores;
 - DSpark: Markov chunk scores and confidence logits.
 
-The draft export intentionally excludes target weights. Do not report runtime
-compatibility until this gate and actual speculative decoding both pass.
+DFlash and DSpark use the public Speculators config/key contract. DFlash2 is
+marked `custom-vllm-ascend-adapter-required`; do not bypass that preflight or
+mislabel it as stock DFlash.
+
+## 9. Acceptance and TPS benchmark
+
+Use the same NPU set sequentially, never two co-resident target replicas:
+
+```bash
+TARGET_MODEL=/shared/models/GLM-5.2-bf16 \
+DRAFTER_EXPORT=/shared/out/glm52-dspark/export \
+PROMPTS_JSONL=/shared/eval/fixed-prompts.jsonl \
+OUT_DIR=/shared/eval/glm52-dspark-b8 \
+TP_SIZE=16 MAX_SAMPLES=100 MAX_TOKENS=2048 \
+bash scripts/eval_vllm_ascend.sh
+```
+
+The output contains `baseline.json`, `speculative.json`, server logs, and
+`comparison.json`. Acceptance is derived from vLLM Prometheus counters using
+the official bonus-inclusive definition. TPS is measured from returned
+completion-token counts and wall time. For temperature zero, exact output
+parity is a hard gate. The launcher intentionally does not enable approximate
+Block Verify or Entropy Verify.
+
+The local test suite checks config/state round-trip and benchmark arithmetic;
+it cannot prove that a particular CANN/vLLM-Ascend image contains the required
+GLM DSpark support. Record the image digest and package versions with every
+hardware result.
 
 ## Legacy v1 policy
 

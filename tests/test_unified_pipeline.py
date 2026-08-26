@@ -117,7 +117,7 @@ class UnifiedPipelineTest(unittest.TestCase):
                     kwargs["selector_loss_weight"] = 1.0
                 if method == "dspark":
                     kwargs.update(
-                        ce_weight=0.1, l1_weight=0.9, confidence_weight=1.0
+                        ce_weight=0.1, tv_weight=0.9, confidence_weight=1.0
                     )
                 trainer = trainer_type(model, self._target_io(), **kwargs)
                 before = {

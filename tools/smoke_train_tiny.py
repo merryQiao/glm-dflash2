@@ -115,7 +115,7 @@ def main() -> None:
         if method == "dflash2":
             kwargs["selector_loss_weight"] = 1.0
         elif method == "dspark":
-            kwargs.update(ce_weight=0.1, l1_weight=0.9, confidence_weight=1.0)
+            kwargs.update(ce_weight=0.1, tv_weight=0.9, confidence_weight=1.0)
         trainer = trainer_types[method](model, _target_io(), **kwargs)
         before = [parameter.detach().clone() for parameter in trainer.parameters()]
         output = trainer(

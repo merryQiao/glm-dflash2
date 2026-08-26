@@ -173,7 +173,7 @@ def _build_trainer(args, draft, target_io, cache_manifest):
         draft,
         target_io,
         ce_weight=0.1,
-        l1_weight=0.9,
+        tv_weight=0.9,
         confidence_weight=1.0,
         **common,
     )
@@ -259,8 +259,8 @@ def _step_metrics(method: str, step) -> dict[str, torch.Tensor]:
         return {
             "ce_numerator": step.ce_numerator,
             "ce_denominator": step.ce_denominator,
-            "l1_numerator": step.l1_numerator,
-            "l1_denominator": step.l1_denominator,
+            "tv_numerator": step.tv_numerator,
+            "tv_denominator": step.tv_denominator,
             "confidence_numerator": step.confidence_numerator,
             "confidence_denominator": step.confidence_denominator,
             "correct": step.correct,
@@ -301,12 +301,12 @@ def _ratios(method: str, reduced: dict[str, torch.Tensor]) -> dict[str, float]:
 
     if method == "dspark":
         ce = ratio("ce_numerator", "ce_denominator")
-        l1 = ratio("l1_numerator", "l1_denominator")
+        tv = ratio("tv_numerator", "tv_denominator")
         confidence = ratio("confidence_numerator", "confidence_denominator")
         return {
-            "loss": 0.1 * ce + 0.9 * l1 + confidence,
+            "loss": 0.1 * ce + 0.9 * tv + confidence,
             "ce_loss": ce,
-            "l1_loss": l1,
+            "tv_loss": tv,
             "confidence_loss": confidence,
             "accuracy": ratio("correct", "valid_tokens"),
             "accept": ratio("accept_total", "valid_blocks"),

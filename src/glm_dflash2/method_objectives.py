@@ -48,9 +48,9 @@ def depth_weighted_objective(
 class DSparkLoss:
     local_total: torch.Tensor
     ce: AdditiveLoss
-    l1: AdditiveLoss
+    tv: AdditiveLoss
     confidence: AdditiveLoss
-    l1_per_token: torch.Tensor
+    tv_per_token: torch.Tensor
     confidence_target: torch.Tensor
     draft_top1_ids: torch.Tensor
 
@@ -96,7 +96,7 @@ def compute_dspark_loss(
     gamma: float,
     vocab_chunk_size: int,
     ce_weight: float = 0.1,
-    l1_weight: float = 0.9,
+    tv_weight: float = 0.9,
     confidence_weight: float = 1.0,
 ) -> DSparkLoss:
     """Exact full-vocabulary DSpark objective with chunk-bounded activations."""
@@ -199,13 +199,15 @@ def compute_dspark_loss(
         )
 
     ce_per_token = (draft_log_z - draft_target_score).reshape(prefix)
-    l1_per_token = l1_flat.reshape(prefix)
-    confidence_target = (1.0 - 0.5 * l1_per_token.detach()).clamp(0.0, 1.0)
+    # Total variation is half the full-vocabulary L1 distance and equals
+    # one minus the exact rejection-sampling distributional overlap.
+    tv_per_token = 0.5 * l1_flat.reshape(prefix)
+    confidence_target = (1.0 - tv_per_token.detach()).clamp(0.0, 1.0)
     confidence_per_token = F.binary_cross_entropy_with_logits(
         confidence_logits.float(), confidence_target, reduction="none"
     )
     ce = depth_weighted_objective(ce_per_token, token_mask, gamma=gamma)
-    l1 = depth_weighted_objective(l1_per_token, token_mask, gamma=gamma)
+    tv = depth_weighted_objective(tv_per_token, token_mask, gamma=gamma)
     confidence = depth_weighted_objective(
         confidence_per_token, token_mask, gamma=gamma
     )
@@ -223,13 +225,13 @@ def compute_dspark_loss(
     return DSparkLoss(
         local_total=(
             float(ce_weight) * ce.mean
-            + float(l1_weight) * l1.mean
+            + float(tv_weight) * tv.mean
             + float(confidence_weight) * confidence.mean
         ),
         ce=ce,
-        l1=l1,
+        tv=tv,
         confidence=confidence,
-        l1_per_token=l1_per_token,
+        tv_per_token=tv_per_token,
         confidence_target=confidence_target,
         draft_top1_ids=best_ids.reshape(prefix),
     )

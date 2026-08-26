@@ -195,10 +195,10 @@ Let `q_d` and `p_d` be the draft and target FP32 softmax distributions. DSpark
 uses the DeepSpec reference definitions:
 
 ```text
-L_L1 = sum_d w_d * sum_v |q_d(v) - p_d(v)| / sum_d w_d
-accept_target_d = clamp(1 - 0.5 * sum_v |q_d(v) - p_d(v)|, 0, 1)
+L_TV = sum_d w_d * 0.5 * sum_v |q_d(v) - p_d(v)| / sum_d w_d
+accept_target_d = clamp(1 - TV_d, 0, 1)
 L_conf = sum_d w_d * BCEWithLogits(c_d, stopgrad(accept_target_d)) / sum_d w_d
-L = 0.1 * L_CE + 0.9 * L_L1 + 1.0 * L_conf
+L = 0.1 * L_CE + 0.9 * L_TV + 1.0 * L_conf
 ```
 
 The Markov head is the official vanilla rank-256
