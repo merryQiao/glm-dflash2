@@ -12,7 +12,8 @@ from .dflash2_objective import compute_acceptance_stats, compute_dflash2_loss
 from .dflash_blocks import DFlashBlocks, build_dflash_blocks, sample_anchor_positions
 from .distributed import global_weighted_mean
 from .draft_backbone import DFlashDraftModel
-from .method_objectives import depth_weighted_objective
+from .dspark_model import DSparkDraftModel
+from .method_objectives import compute_dspark_loss, depth_weighted_objective
 from .target_io import FrozenTargetIO, validate_cache_io_compatibility
 
 
@@ -52,12 +53,78 @@ class _PreparedStep:
     projection: ChunkedLmProjection
 
 
+@dataclass(frozen=True)
+class _PreparedHidden:
+    blocks: DFlashBlocks
+    pred_hidden: torch.Tensor
+    pred_targets: torch.Tensor
+    pred_mask: torch.Tensor
+
+
+@dataclass(frozen=True)
+class OfflineDSparkStepOutput:
+    loss: torch.Tensor
+    ce_loss: torch.Tensor
+    l1_loss: torch.Tensor
+    confidence_loss: torch.Tensor
+    accuracy: torch.Tensor
+    accept_len: torch.Tensor
+    valid_tokens: torch.Tensor
+    valid_blocks: torch.Tensor
+    ce_numerator: torch.Tensor
+    ce_denominator: torch.Tensor
+    l1_numerator: torch.Tensor
+    l1_denominator: torch.Tensor
+    confidence_numerator: torch.Tensor
+    confidence_denominator: torch.Tensor
+    correct: torch.Tensor
+    accept_total: torch.Tensor
+    anchor_positions: torch.Tensor
+    block_keep_mask: torch.Tensor
+
+
+def gather_dspark_teacher_hidden(
+    target_final_hidden: torch.Tensor,
+    input_ids: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    *,
+    prediction_depth: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather AR state/predecessor at ``a+d`` for target token ``a+d+1``."""
+
+    if target_final_hidden.ndim != 3 or input_ids.shape != target_final_hidden.shape[:2]:
+        raise ValueError("target_final_hidden must align with input_ids")
+    if anchor_positions.ndim != 2 or block_keep_mask.shape != anchor_positions.shape:
+        raise ValueError("anchor positions and keep mask must have shape [batch, anchors]")
+    if anchor_positions.shape[0] != input_ids.shape[0] or prediction_depth < 1:
+        raise ValueError("invalid DSpark gather dimensions")
+    batch, tokens = input_ids.shape
+    anchors = anchor_positions.to(device=input_ids.device, dtype=torch.long)
+    depth = torch.arange(prediction_depth, device=input_ids.device)
+    positions = anchors[..., None] + depth
+    safe = positions.clamp(0, max(tokens - 1, 0))
+    expanded_ids = input_ids[:, None, :].expand(batch, anchors.shape[1], tokens)
+    predecessors = expanded_ids.gather(2, safe)
+    hidden_size = target_final_hidden.shape[-1]
+    expanded_hidden = target_final_hidden[:, None].expand(
+        batch, anchors.shape[1], tokens, hidden_size
+    )
+    teacher = expanded_hidden.gather(
+        2, safe[..., None].expand(*safe.shape, hidden_size)
+    )
+    keep = block_keep_mask.to(device=input_ids.device, dtype=torch.bool)
+    teacher = teacher.masked_fill(~keep[..., None, None], 0)
+    predecessors = predecessors.masked_fill(~keep[..., None], 0)
+    return teacher, predecessors
+
+
 class _OfflineDFlashBase(nn.Module):
     """Shared cache, anchor, block, and frozen-I/O preparation."""
 
     def __init__(
         self,
-        draft_model: DFlashDraftModel | Qwen3DFlash2DraftModel,
+        draft_model: DFlashDraftModel | Qwen3DFlash2DraftModel | DSparkDraftModel,
         target_io: FrozenTargetIO,
         *,
         cache_manifest: Mapping[str, Any],
@@ -138,15 +205,14 @@ class _OfflineDFlashBase(nn.Module):
             num_anchors=self.num_anchors,
         )
 
-    def _prepare(
+    def _prepare_hidden(
         self,
         batch: Mapping[str, Any],
         *,
-        top_k: int,
         epoch: int,
         anchor_positions: torch.Tensor | None,
         block_keep_mask: torch.Tensor | None,
-    ) -> _PreparedStep:
+    ) -> _PreparedHidden:
         self.assert_frozen_io_unchanged()
         input_ids = batch["input_ids"]
         loss_mask = batch["loss_mask"].to(torch.bool)
@@ -182,16 +248,39 @@ class _OfflineDFlashBase(nn.Module):
         )[:, :, 1:]
         pred_targets = blocks.target_ids[:, :, 1:]
         pred_mask = blocks.target_mask[:, :, 1:]
+        return _PreparedHidden(blocks, pred_hidden, pred_targets, pred_mask)
+
+    def _prepare(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        top_k: int,
+        epoch: int,
+        anchor_positions: torch.Tensor | None,
+        block_keep_mask: torch.Tensor | None,
+    ) -> _PreparedStep:
+        prepared = self._prepare_hidden(
+            batch,
+            epoch=epoch,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+        )
         projection = chunked_lm_projection(
-            pred_hidden,
-            pred_targets,
+            prepared.pred_hidden,
+            prepared.pred_targets,
             self.target_lm_head_weight,
             top_k=top_k,
             token_chunk_size=self.token_chunk_size,
             vocab_chunk_size=self.vocab_chunk_size,
-            token_mask=pred_mask,
+            token_mask=prepared.pred_mask,
         )
-        return _PreparedStep(blocks, pred_hidden, pred_targets, pred_mask, projection)
+        return _PreparedStep(
+            prepared.blocks,
+            prepared.pred_hidden,
+            prepared.pred_targets,
+            prepared.pred_mask,
+            projection,
+        )
 
     @staticmethod
     def _metrics(
@@ -350,6 +439,104 @@ class OfflineDFlash2Trainer(_OfflineDFlashBase):
             selector_accept_total=selector_accept_total.detach(),
             candidate_hits=losses.candidate_hits,
             candidate_total=losses.candidate_total,
+            anchor_positions=prepared.blocks.anchor_positions.detach(),
+            block_keep_mask=prepared.blocks.block_keep_mask.detach(),
+        )
+
+
+class OfflineDSparkTrainer(_OfflineDFlashBase):
+    def __init__(
+        self,
+        *args: Any,
+        ce_weight: float = 0.1,
+        l1_weight: float = 0.9,
+        confidence_weight: float = 1.0,
+        **kwargs: Any,
+    ) -> None:
+        # DSpark does not use top-k token projection, but accepts the common
+        # chunk argument surface so unified launchers stay method-independent.
+        kwargs.setdefault("token_chunk_size", 1)
+        super().__init__(*args, **kwargs)
+        if not isinstance(self.draft_model, DSparkDraftModel):
+            raise TypeError("OfflineDSparkTrainer requires DSparkDraftModel")
+        self.ce_weight = float(ce_weight)
+        self.l1_weight = float(l1_weight)
+        self.confidence_weight = float(confidence_weight)
+
+    def forward(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        epoch: int = 0,
+        anchor_positions: torch.Tensor | None = None,
+        block_keep_mask: torch.Tensor | None = None,
+    ) -> OfflineDSparkStepOutput:
+        final_hidden = batch.get("target_final_hidden")
+        if not isinstance(final_hidden, torch.Tensor):
+            raise ValueError("DSpark requires target_final_hidden from cache schema v2")
+        prepared = self._prepare_hidden(
+            batch,
+            epoch=epoch,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+        )
+        teacher_hidden, predecessors = gather_dspark_teacher_hidden(
+            final_hidden,
+            batch["input_ids"],
+            prepared.blocks.anchor_positions,
+            prepared.blocks.block_keep_mask,
+            prediction_depth=prepared.pred_hidden.shape[-2],
+        )
+        confidence_logits = self.draft_model.confidence_logits(prepared.pred_hidden)
+        losses = compute_dspark_loss(
+            draft_hidden=prepared.pred_hidden,
+            target_hidden=teacher_hidden.to(prepared.pred_hidden.dtype),
+            target_ids=prepared.pred_targets,
+            predecessor_ids=predecessors,
+            confidence_logits=confidence_logits,
+            lm_head_weight=self.target_lm_head_weight,
+            markov_head=self.draft_model.markov_head,
+            token_mask=prepared.pred_mask,
+            gamma=self.gamma,
+            vocab_chunk_size=self.vocab_chunk_size,
+            ce_weight=self.ce_weight,
+            l1_weight=self.l1_weight,
+            confidence_weight=self.confidence_weight,
+        )
+        ce_loss = global_weighted_mean(losses.ce.mean, losses.ce.denominator)
+        l1_loss = global_weighted_mean(losses.l1.mean, losses.l1.denominator)
+        confidence_loss = global_weighted_mean(
+            losses.confidence.mean, losses.confidence.denominator
+        )
+        total = (
+            self.ce_weight * ce_loss
+            + self.l1_weight * l1_loss
+            + self.confidence_weight * confidence_loss
+        )
+        valid = prepared.pred_mask.to(torch.bool)
+        valid_tokens = valid.sum()
+        correct = ((losses.draft_top1_ids == prepared.pred_targets) & valid).sum()
+        accuracy = correct.float() / valid_tokens.clamp_min(1).float()
+        accept_len, accept_total, valid_blocks = compute_acceptance_stats(
+            losses.draft_top1_ids, prepared.pred_targets, valid
+        )
+        return OfflineDSparkStepOutput(
+            loss=total,
+            ce_loss=ce_loss.detach(),
+            l1_loss=l1_loss.detach(),
+            confidence_loss=confidence_loss.detach(),
+            accuracy=accuracy.detach(),
+            accept_len=accept_len.detach(),
+            valid_tokens=valid_tokens.detach(),
+            valid_blocks=valid_blocks.detach(),
+            ce_numerator=losses.ce.numerator.detach(),
+            ce_denominator=losses.ce.denominator.detach(),
+            l1_numerator=losses.l1.numerator.detach(),
+            l1_denominator=losses.l1.denominator.detach(),
+            confidence_numerator=losses.confidence.numerator.detach(),
+            confidence_denominator=losses.confidence.denominator.detach(),
+            correct=correct.detach(),
+            accept_total=accept_total.detach(),
             anchor_positions=prepared.blocks.anchor_positions.detach(),
             block_keep_mask=prepared.blocks.block_keep_mask.detach(),
         )
