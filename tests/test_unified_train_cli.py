@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+import unittest
+
+from glm_dflash2.dflash2_model import Qwen3DFlash2DraftModel, build_dflash2_config
+from glm_dflash2.draft_backbone import DFlashDraftModel
+from glm_dflash2.dspark_model import DSparkDraftModel
+from tools.train_drafter_offline import (
+    build_method_model,
+    build_parser,
+    validate_aligned_cache_manifest,
+)
+
+
+class UnifiedTrainCliTest(unittest.TestCase):
+    def _config(self):
+        return build_dflash2_config(
+            vocab_size=11, hidden_size=8, intermediate_size=16,
+            num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
+            head_dim=4, target_layer_ids=[0, 1], num_target_layers=2,
+            block_size=4, mask_token_id=10, conv_group_size=4,
+            selector_rank=4, selector_top_k=4, sliding_window=None,
+        )
+
+    def test_parser_selects_method_but_not_target_or_mutable_architecture(self):
+        parser = build_parser()
+        destinations = {action.dest for action in parser._actions}
+        self.assertNotIn("target_model", destinations)
+        args = parser.parse_args(
+            [
+                "--method", "dspark", "--cache-dir", "/cache",
+                "--target-io-dir", "/io", "--output-dir", "/out",
+                "--mask-token-id", "9",
+            ]
+        )
+        self.assertEqual(args.method, "dspark")
+        self.assertEqual(args.block_size, 16)
+        self.assertEqual(args.num_anchors, 64)
+        self.assertEqual(args.gamma, 7.0)
+        self.assertEqual(args.selector_rank, 256)
+        self.assertEqual(args.selector_top_k, 16)
+        self.assertEqual(args.markov_rank, 256)
+
+    def test_method_dispatch_changes_only_method_specific_modules(self):
+        expected = {
+            "dflash": DFlashDraftModel,
+            "dflash2": Qwen3DFlash2DraftModel,
+            "dspark": DSparkDraftModel,
+        }
+        for method, model_type in expected.items():
+            with self.subTest(method=method):
+                model = build_method_model(method, self._config(), markov_rank=4)
+                self.assertIsInstance(model, model_type)
+                self.assertEqual(tuple(model.target_layer_ids), (0, 1))
+                self.assertIsNone(model.config.sliding_window)
+                self.assertEqual(model.config.drafter_method, method)
+                self.assertEqual(model.config.position_contract, "absolute_anchor_plus_local")
+
+    def test_all_aligned_methods_reject_legacy_cache(self):
+        for method in ("dflash", "dflash2", "dspark"):
+            with self.subTest(method=method), self.assertRaisesRegex(ValueError, "schema v2"):
+                validate_aligned_cache_manifest(
+                    {"spec": {"schema_version": 1}, "aligned_methods_allowed": False},
+                    method=method,
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

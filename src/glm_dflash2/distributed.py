@@ -67,6 +67,26 @@ def initialize_distributed(device_kind: str, *, timeout_minutes: int = 30) -> Di
     return DistributedContext(device, backend, rank, local_rank, world_size)
 
 
+def fsdp2_method_modules(model: nn.Module) -> list[tuple[str, nn.Module, bool]]:
+    """Return heads invoked outside the common backbone forward.
+
+    The final boolean keeps gathered parameters resident across repeated calls.
+    DSpark invokes its Markov head once per vocabulary chunk, so resharing after
+    every chunk would add a collective to every chunk.
+    """
+
+    result: list[tuple[str, nn.Module, bool]] = []
+    for name, keep_unsharded in (
+        ("candidate_selector", False),
+        ("markov_head", True),
+        ("confidence_head", False),
+    ):
+        module = getattr(model, name, None)
+        if module is not None:
+            result.append((name, module, keep_unsharded))
+    return result
+
+
 def apply_fsdp2(model: nn.Module, *, enabled: bool, dtype: torch.dtype = torch.bfloat16) -> nn.Module:
     if not enabled:
         return model
@@ -80,11 +100,12 @@ def apply_fsdp2(model: nn.Module, *, enabled: bool, dtype: torch.dtype = torch.b
         raise ValueError("FSDP2 draft model must expose decoder layers")
     for layer in layers:
         fully_shard(layer, mp_policy=policy, reshard_after_forward=True)
-    selector = getattr(model, "candidate_selector", None)
-    if selector is not None:
-        # The selector is invoked as its own module after the frozen chunked LM
-        # projection, so it needs its own all-gather/reshard lifecycle.
-        fully_shard(selector, mp_policy=policy, reshard_after_forward=True)
+    for _, module, keep_unsharded in fsdp2_method_modules(model):
+        fully_shard(
+            module,
+            mp_policy=policy,
+            reshard_after_forward=not keep_unsharded,
+        )
     fully_shard(model, mp_policy=policy, reshard_after_forward=True)
     return model
 

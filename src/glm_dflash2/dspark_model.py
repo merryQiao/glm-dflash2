@@ -46,6 +46,21 @@ class LowRankMarkovHead(nn.Module):
         successor = self.successor_codebook[int(vocab_start) : int(vocab_end)]
         return torch.einsum("...r,vr->...v", gate, successor)
 
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+        vocab_start: int,
+        vocab_end: int,
+    ) -> torch.Tensor:
+        """Score one vocabulary chunk through ``nn.Module.__call__``.
+
+        This is deliberately a real ``forward`` so FSDP2 hooks can materialize
+        the head when it is invoked after the common backbone forward.
+        """
+
+        return self.score_chunk(hidden, predecessor_ids, vocab_start, vocab_end)
+
 
 class DSparkDraftModel(DFlashDraftModel):
     """Common plain GLM draft backbone with DSpark method heads."""

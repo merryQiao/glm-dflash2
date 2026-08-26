@@ -8,6 +8,7 @@ import torch
 
 from glm_dflash2.distributed import (
     configure_accumulation,
+    fsdp2_method_modules,
     global_weighted_mean,
     rank_epoch_seed,
     resolve_device_backend,
@@ -27,6 +28,24 @@ class _FakeFSDP2:
 
 
 class DistributedTest(unittest.TestCase):
+    def test_fsdp2_method_modules_cover_heads_called_after_backbone_forward(self):
+        class Draft(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.candidate_selector = torch.nn.Linear(2, 2)
+                self.markov_head = torch.nn.Linear(2, 2)
+                self.confidence_head = torch.nn.Linear(2, 1)
+
+        modules = fsdp2_method_modules(Draft())
+        self.assertEqual(
+            [(name, keep_unsharded) for name, _, keep_unsharded in modules],
+            [
+                ("candidate_selector", False),
+                ("markov_head", True),
+                ("confidence_head", False),
+            ],
+        )
+
     def test_cpu_backend_and_rank_epoch_seed(self):
         device, backend = resolve_device_backend("cpu", local_rank=0)
         self.assertEqual(device, torch.device("cpu"))

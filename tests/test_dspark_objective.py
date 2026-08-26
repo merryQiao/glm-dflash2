@@ -110,6 +110,35 @@ class DSparkObjectiveTest(unittest.TestCase):
         self.assertIsNotNone(confidence.grad)
         self.assertTrue(any(parameter.grad is not None for parameter in markov.parameters()))
 
+    def test_chunked_objective_invokes_markov_through_module_forward(self):
+        draft, teacher, weight, markov = self._fixture()
+        target_ids = torch.tensor([[[2, 4]]])
+        predecessors = torch.tensor([[[1, 2]]])
+        confidence = torch.zeros_like(target_ids, dtype=torch.float32)
+        mask = torch.ones_like(target_ids, dtype=torch.bool)
+        calls = []
+
+        original = markov.forward
+
+        def remember(*args, **kwargs):
+            calls.append((args[2], args[3]))
+            return original(*args, **kwargs)
+
+        with mock.patch.object(markov, "forward", side_effect=remember):
+            compute_dspark_loss(
+                draft_hidden=draft,
+                target_hidden=teacher,
+                target_ids=target_ids,
+                predecessor_ids=predecessors,
+                confidence_logits=confidence,
+                lm_head_weight=weight,
+                markov_head=markov,
+                token_mask=mask,
+                gamma=7.0,
+                vocab_chunk_size=2,
+            )
+        self.assertGreater(len(calls), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
