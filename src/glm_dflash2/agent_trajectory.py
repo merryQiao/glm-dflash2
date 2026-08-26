@@ -267,6 +267,7 @@ class OpenAIChatClient:
         }
         if self.config.return_token_ids:
             payload["return_prompt_token_ids"] = True
+            payload["return_token_ids"] = True
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"

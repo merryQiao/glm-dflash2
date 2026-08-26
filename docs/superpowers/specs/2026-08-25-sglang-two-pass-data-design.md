@@ -19,7 +19,8 @@ The GLM version launches an OpenAI-compatible SGLang server or reuses an
 existing endpoint. It stores the complete canonical message trajectory,
 ordered tool schemas, tool events, generation-start message index, exact
 chat-template kwargs, structured reasoning/tool-call fields, per-round
-prompt/output token IDs when exposed by SGLang, model/sampling metadata,
+prompt/output token IDs required from SGLang for every new rollout,
+model/sampling metadata,
 source metadata, and validation result. Output is
 append-only JSONL with a single-writer lock and a manifest. A trajectory is
 committed only after it ends with a resolved assistant response and passes
@@ -27,8 +28,12 @@ message/tool validation.
 
 After rollout, the same target tokenizer renders the complete final message
 list with the frozen ordered tools and identical chat-template kwargs. Prefix
-stability is checked around every generated assistant turn, and available
-server token IDs are used as per-round golden checks rather than discarded.
+stability is checked around every generated assistant turn, and server
+prompt/response token IDs are mandatory per-round golden checks for new
+rollouts. Missing or mismatched IDs reject the sample instead of falling back
+to detokenize/re-tokenize. Restored original Open-SWE trajectories are recorded
+as a separate teacher-forced source route because their historical server IDs
+are unavailable.
 The stored `input_ids` are the exact rendered final trajectory and
 `loss_mask` is token-aligned with SpecForge DFlash: tokens belonging to
 generated assistant turns are 1; system, source user, later user, and tool

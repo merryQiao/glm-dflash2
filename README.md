@@ -26,7 +26,9 @@ commands and hardware gates.
 1. **Stage A — sampled coding-agent trajectories.** SGLang runs GLM-5.2 with
    the production sampling policy (default `temperature=1.0`, `top_p=0.95`,
    top-k disabled), executes bounded tools, and freezes the resulting
-   `input_ids` and target-position `loss_mask`.
+   `input_ids` and target-position `loss_mask`. Every newly sampled assistant
+   turn must return both server prompt IDs and sampled response IDs; the sample
+   is rejected if either stream is missing or differs from the frozen replay.
 2. **Stage B — one teacher-forced target forward.** A fresh SGLang internal
    runner consumes the frozen token path and captures the five auxiliary
    streams and post-final-norm LM-head input together.
@@ -151,6 +153,14 @@ deployment must bind that endpoint to the same immutable model revision as
 `MODEL_PATH`; a local temporary server is fingerprint-verifiable.
 Repository-backed rows without a materialized workspace are hard errors; they
 are never silently converted into invented tool traces.
+
+The SGLang endpoint must support non-streaming chat requests with both
+`return_prompt_token_ids=true` and `return_token_ids=true`. Stage A deliberately
+fails closed when a new rollout does not return exact per-round token IDs;
+detokenized text is never silently re-tokenized and accepted as the sampled
+path. Restored Open-SWE source trajectories are a separate, explicitly marked
+`teacher_forced_original_trajectory` route because their original server token
+metadata is not available.
 
 The Stage A route behavior follows the specified SpecForge
 `vibe_coding_qwen38.py` pipeline:

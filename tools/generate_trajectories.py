@@ -543,6 +543,7 @@ def _generate_one(
             trajectory,
             chat_template_kwargs=chat_kwargs,
             max_sequence_tokens=args.max_sequence_tokens,
+            require_server_token_ids=route != "original_trajectory",
         )
     )
     trajectory["stage_a_complete"] = True

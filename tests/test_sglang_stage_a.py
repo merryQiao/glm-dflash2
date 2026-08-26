@@ -57,7 +57,7 @@ class SGLangStageATest(unittest.TestCase):
         self.assertEqual(command[command.index("--moe-a2a-backend") + 1], "deepep")
         self.assertEqual(command[command.index("--deepep-mode") + 1], "auto")
 
-    def test_chat_payload_preserves_tool_order_and_requests_prompt_token_ids(self):
+    def test_chat_payload_preserves_tool_order_and_requests_all_token_ids(self):
         client = OpenAIChatClient(
             ChatCompletionConfig(
                 endpoint="http://localhost:30000",
@@ -91,7 +91,7 @@ class SGLangStageATest(unittest.TestCase):
         self.assertEqual([tool["function"]["name"] for tool in payload["tools"]], ["first", "second"])
         self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": True, "custom": "kept"})
         self.assertTrue(payload["return_prompt_token_ids"])
-        self.assertNotIn("return_token_ids", payload)
+        self.assertTrue(payload["return_token_ids"])
         self.assertEqual(value["_response_metadata"]["prompt_token_ids"], [1, 2])
         self.assertEqual(value["_response_metadata"]["response_token_ids"], [3, 4])
 

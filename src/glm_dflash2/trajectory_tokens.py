@@ -36,6 +36,7 @@ def freeze_trajectory_tokens(
     *,
     chat_template_kwargs: Mapping[str, Any],
     max_sequence_tokens: int | None = None,
+    require_server_token_ids: bool = False,
 ) -> dict[str, Any]:
     """Render one immutable trajectory and create a DFlash token-position mask.
 
@@ -94,6 +95,10 @@ def freeze_trajectory_tokens(
         if index >= start and isinstance(message, Mapping) and message.get("role") == "assistant"
     ]
     response_metadata = trajectory.get("response_metadata") or []
+    if require_server_token_ids and len(response_metadata) != len(generated_indices):
+        raise TrajectoryTokenError(
+            "online trajectory requires response metadata for every generated assistant turn"
+        )
     if response_metadata and len(response_metadata) != len(generated_indices):
         raise TrajectoryTokenError(
             "response metadata count differs from generated assistant turns"
@@ -120,6 +125,13 @@ def freeze_trajectory_tokens(
         metadata = response_metadata[ordinal] if response_metadata else {}
         server_prompt = metadata.get("prompt_token_ids")
         server_response = metadata.get("response_token_ids")
+        if require_server_token_ids and (
+            server_prompt is None or server_response is None
+        ):
+            raise TrajectoryTokenError(
+                f"round {ordinal} online trajectory requires prompt and sampled "
+                "response token IDs"
+            )
         if server_prompt is None and server_response is None:
             round_checks.append("unavailable")
             continue
@@ -151,6 +163,7 @@ def freeze_trajectory_tokens(
             "generation_start_message_index": start,
             "chat_template_kwargs": kwargs,
             "round_token_checks": round_checks,
+            "sampled_response_ids_verified": bool(require_server_token_ids),
             "render_fingerprint": _fingerprint(
                 tokenizer, tools=ordered_tools, chat_template_kwargs=kwargs
             ),

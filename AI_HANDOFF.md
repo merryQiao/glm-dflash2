@@ -53,7 +53,8 @@ Stage A 不只是生成一段文本。它会：
 2. 对普通 repo/coding case 建立隔离 workspace，执行真实工具调用；
 3. 对 Open-SWE prefix 路由恢复原始完整 trajectory；
 4. 使用 GLM-5.2 sampling 进行多轮 agent rollout；
-5. 用同一 tokenizer/chat template 冻结完整 `input_ids`；
+5. 请求 SGLang 返回每轮 prompt IDs 和真实 sampled response IDs，并与同一
+   tokenizer/chat template 的完整回放逐 token 对齐后冻结 `input_ids`；
 6. 生成 target-token-position 语义的 `loss_mask`；
 7. 逐条 fsync，并通过 manifest 固定 resume contract。
 
@@ -63,6 +64,12 @@ AR CE 的左移标签。
 
 输出 manifest 只有在 shard 所有 ID 都成功提交且没有 unresolved error 时才是
 `frozen`。`MAX_SAMPLES` smoke 生成的是 `partial`，不能冒充完整训练集。
+
+新生成的 rollout 必须在每轮同时拿到 `prompt_token_ids` 与
+`response_token_ids`；缺失或逐 token 不一致都拒绝整条样本，禁止把 response 文本
+重新 tokenize 后冒充真实采样路径。Open-SWE 原始完整轨迹没有当时的 server token
+metadata，因此走明确的 `teacher_forced_original_trajectory` 路由，不能标记为
+`sampled_response_ids_verified=true`。
 
 推荐复用已经部署好的 GLM-5.2 SGLang endpoint：
 

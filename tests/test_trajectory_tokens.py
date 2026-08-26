@@ -98,12 +98,64 @@ class TrajectoryTokensTest(unittest.TestCase):
                 {"prompt_token_ids": prompt, "response_token_ids": through[len(prompt):]}
             )
         value["response_metadata"] = metadata
-        frozen = freeze_trajectory_tokens(tokenizer, value, chat_template_kwargs=kwargs)
+        frozen = freeze_trajectory_tokens(
+            tokenizer,
+            value,
+            chat_template_kwargs=kwargs,
+            require_server_token_ids=True,
+        )
         self.assertEqual(frozen["token_contract"]["round_token_checks"], ["matched", "matched"])
+        self.assertTrue(frozen["token_contract"]["sampled_response_ids_verified"])
 
         value["response_metadata"][0]["response_token_ids"] = [999]
         with self.assertRaisesRegex(TrajectoryTokenError, "response token IDs differ"):
-            freeze_trajectory_tokens(tokenizer, value, chat_template_kwargs=kwargs)
+            freeze_trajectory_tokens(
+                tokenizer,
+                value,
+                chat_template_kwargs=kwargs,
+                require_server_token_ids=True,
+            )
+
+    def test_exact_online_mode_rejects_missing_sampled_response_ids(self):
+        value = trajectory()
+        tokenizer = StableTokenizer()
+        tools = value["tools"]
+        kwargs = {"enable_thinking": True}
+        generated_indices = [2, 4]
+        value["response_metadata"] = [
+            {
+                "prompt_token_ids": tokenizer.apply_chat_template(
+                    value["messages"][:index],
+                    tools=tools,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    **kwargs,
+                ),
+                "response_token_ids": None,
+            }
+            for index in generated_indices
+        ]
+
+        with self.assertRaisesRegex(
+            TrajectoryTokenError, "requires prompt and sampled response token IDs"
+        ):
+            freeze_trajectory_tokens(
+                tokenizer,
+                value,
+                chat_template_kwargs=kwargs,
+                require_server_token_ids=True,
+            )
+
+    def test_exact_online_mode_rejects_missing_round_metadata(self):
+        with self.assertRaisesRegex(
+            TrajectoryTokenError, "requires response metadata for every generated assistant turn"
+        ):
+            freeze_trajectory_tokens(
+                StableTokenizer(),
+                trajectory(),
+                chat_template_kwargs={"enable_thinking": True},
+                require_server_token_ids=True,
+            )
 
     def test_checks_prompt_ids_when_server_does_not_return_response_ids(self):
         value = trajectory()
