@@ -1,4 +1,5 @@
 data/vibe_coding_630k/processed/
 outputs/
+.worktrees/
 *.pyc
 __pycache__/
