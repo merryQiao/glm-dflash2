@@ -10,8 +10,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
@@ -89,6 +91,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mem-fraction-static", type=float, default=0.90)
     parser.add_argument("--context-length", type=int, default=131072)
     parser.add_argument("--max-running-requests", type=int, default=1)
+    parser.add_argument("--max-total-tokens", type=int, default=131072)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Concurrent trajectory episodes; SGLang concurrency is limited separately.",
+    )
+    parser.add_argument("--episode-retries", type=int, default=2)
+    parser.add_argument("--retry-backoff-seconds", type=float, default=1.0)
     parser.add_argument("--server-extra-arg", action="append", default=[])
     parser.add_argument("--workspace-map", type=Path)
     parser.add_argument(
@@ -131,6 +142,112 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--browser-max-calls", type=int, default=8)
     parser.add_argument("--show-result", action="store_true")
     return parser.parse_args()
+
+
+class ThreadLocalClientPool:
+    """Create one non-shared closeable client per trajectory worker."""
+
+    def __init__(self, factory: Callable[[], Any]) -> None:
+        self._factory = factory
+        self._local = threading.local()
+        self._clients: list[Any] = []
+        self._lock = threading.Lock()
+
+    def get(self) -> Any:
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = self._factory()
+            self._local.client = client
+            with self._lock:
+                self._clients.append(client)
+        return client
+
+    def close(self) -> None:
+        with self._lock:
+            clients, self._clients = self._clients, []
+        for client in clients:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()
+            elif getattr(client, "session", None) is not None:
+                client.session.close()
+
+
+class ConcurrencyLimitedChatClient:
+    """Limit model HTTP calls while leaving tool execution fully concurrent."""
+
+    def __init__(self, client: Any, semaphore: threading.BoundedSemaphore) -> None:
+        self._client = client
+        self._semaphore = semaphore
+
+    def complete(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        with self._semaphore:
+            return self._client.complete(messages, tools)
+
+    def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if close is not None:
+            close()
+        elif getattr(self._client, "session", None) is not None:
+            self._client.session.close()
+
+
+def bounded_completed_futures(
+    function: Callable[[Any], Any],
+    values: Iterable[Any],
+    *,
+    max_workers: int,
+    max_pending: int,
+) -> Iterator[tuple[Any, Future[Any]]]:
+    """Submit bounded work and yield completed futures without head-of-line blocking."""
+
+    if max_workers < 1:
+        raise ValueError("max_workers must be positive")
+    if max_pending < 1:
+        raise ValueError("max_pending must be positive")
+    pending: dict[Future[Any], Any] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for value in values:
+            future = executor.submit(function, value)
+            pending[future] = value
+            if len(pending) < max_pending:
+                continue
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for completed in finished:
+                yield pending.pop(completed), completed
+        while pending:
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for completed in finished:
+                yield pending.pop(completed), completed
+
+
+def retry_call(
+    function: Callable[[], Any],
+    *,
+    retries: int,
+    backoff_seconds: float,
+) -> Any:
+    """Retry one isolated episode with bounded exponential backoff."""
+
+    if retries < 0:
+        raise ValueError("retries cannot be negative")
+    if backoff_seconds < 0:
+        raise ValueError("backoff_seconds cannot be negative")
+    for attempt in range(retries + 1):
+        try:
+            return function()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            if attempt == retries:
+                raise
+            if backoff_seconds:
+                time.sleep(backoff_seconds * (2**attempt))
+    raise AssertionError("unreachable")
 
 
 def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -215,6 +332,7 @@ def _endpoint(args: argparse.Namespace, temp_root: Path) -> Iterator[str]:
         context_length=args.context_length,
         mem_fraction_static=args.mem_fraction_static,
         max_running_requests=args.max_running_requests,
+        max_total_tokens=args.max_total_tokens,
         quantization=args.quantization,
         moe_a2a_backend=args.moe_a2a_backend,
         deepep_mode=args.deepep_mode,
@@ -422,6 +540,16 @@ def main() -> int:
         raise FileNotFoundError(args.model_path)
     if args.max_samples is not None and args.max_samples < 1:
         raise ValueError("--max-samples must be positive")
+    if args.workers < 1:
+        raise ValueError("--workers must be positive")
+    if args.max_running_requests < 1:
+        raise ValueError("--max-running-requests must be positive")
+    if args.max_total_tokens < 1:
+        raise ValueError("--max-total-tokens must be positive")
+    if args.episode_retries < 0:
+        raise ValueError("--episode-retries cannot be negative")
+    if args.retry_backoff_seconds < 0:
+        raise ValueError("--retry-backoff-seconds cannot be negative")
     if args.temperature < 0:
         raise ValueError("--temperature cannot be negative")
     if not 0 < args.top_p <= 1:
@@ -490,6 +618,7 @@ def main() -> int:
             "mem_fraction_static": args.mem_fraction_static,
             "context_length": args.context_length,
             "max_running_requests": args.max_running_requests,
+            "max_total_tokens": args.max_total_tokens,
             "server_extra_args": list(args.server_extra_arg),
             # The OpenAI protocol exposes a served name, not a weight digest.
             "weight_identity_verified": args.endpoint is None,
@@ -506,6 +635,12 @@ def main() -> int:
         "max_rounds": args.max_rounds,
         "max_new_tokens": args.max_new_tokens,
         "max_sequence_tokens": args.max_sequence_tokens,
+        "execution": {
+            "workers": args.workers,
+            "max_pending": args.workers * 2,
+            "episode_retries": args.episode_retries,
+            "retry_backoff_seconds": args.retry_backoff_seconds,
+        },
         "input_kinds": args.input_kinds,
         "row_id": args.row_id,
         "workspace": {
@@ -558,27 +693,38 @@ def main() -> int:
             # corresponding ledger resolution. The committed JSONL wins.
             for committed_id in done & set(error_ledger.unresolved_ids):
                 error_ledger.resolve(sample_id=committed_id, source_index=-1)
-            client = OpenAIChatClient(
-                ChatCompletionConfig(
-                    endpoint=endpoint,
-                    model=args.served_model_name,
-                    timeout_seconds=args.timeout,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    top_k=args.top_k,
-                    max_tokens=args.max_new_tokens,
-                    reasoning_effort=None,
-                    chat_template_kwargs=chat_kwargs,
-                    return_token_ids=True,
+            chat_config = ChatCompletionConfig(
+                endpoint=endpoint,
+                model=args.served_model_name,
+                timeout_seconds=args.timeout,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                max_tokens=args.max_new_tokens,
+                reasoning_effort=None,
+                chat_template_kwargs=chat_kwargs,
+                return_token_ids=True,
+            )
+            probe_client = OpenAIChatClient(chat_config)
+            probe_client.assert_model_available()
+            stack.callback(probe_client.session.close)
+            completion_slots = threading.BoundedSemaphore(args.max_running_requests)
+            chat_clients = ThreadLocalClientPool(
+                lambda: ConcurrencyLimitedChatClient(
+                    OpenAIChatClient(chat_config), completion_slots
                 )
             )
-            client.assert_model_available()
+            stack.callback(chat_clients.close)
             uses_any_web = args.web_tools_for_all or any(
                 kind in set(args.web_input_kind) for kind in selected["input_kind"].unique().to_pylist()
             )
-            web_client = _web_client(args) if uses_any_web else None
-            if web_client is not None:
-                stack.callback(web_client.close)
+            web_clients = (
+                ThreadLocalClientPool(lambda: _web_client(args))
+                if uses_any_web
+                else None
+            )
+            if web_clients is not None:
+                stack.callback(web_clients.close)
             open_swe_store = (
                 OpenSWETrajectoryStore(args.open_swe_store)
                 if needs_open_swe_store
@@ -588,49 +734,33 @@ def main() -> int:
                 stack.callback(open_swe_store.close)
 
             attempted = accepted = 0
-            for source_index, source_row in enumerate(iter_table_rows(selected)):
-                if not owns_source_index(source_index, shard_index=args.shard_index, shard_count=args.shard_count):
-                    continue
-                sample_id = str(source_row.get("id") or source_row.get("source_id") or f"source-index-{source_index}")
-                if sample_id in done:
-                    continue
-                if args.max_samples is not None and attempted >= args.max_samples:
-                    break
-                attempted += 1
-                try:
-                    item = row_to_model_input(source_row)
-                    trajectory, route = _generate_one(
-                        item=item,
-                        source_index=source_index,
-                        args=args,
-                        client=client,
-                        tokenizer=tokenizer,
-                        chat_kwargs=chat_kwargs,
-                        open_swe_store=open_swe_store,
-                        web_client=web_client,
-                        workspace_provider=workspace_provider,
-                    )
-                    writer.append(trajectory)
-                except (KeyboardInterrupt, SystemExit):
-                    raise
-                except BaseException as exc:
-                    error_ledger.record_error(
-                        sample_id=sample_id, source_index=source_index, error=exc
-                    )
-                    print(
-                        compact_json(
-                            {
-                                "id": sample_id,
-                                "source_index": source_index,
-                                "status": "error",
-                                "error_type": type(exc).__name__,
-                                "error": str(exc),
-                            }
-                        ),
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    continue
+
+            def record_error(source_index: int, sample_id: str, exc: BaseException) -> None:
+                error_ledger.record_error(
+                    sample_id=sample_id, source_index=source_index, error=exc
+                )
+                print(
+                    compact_json(
+                        {
+                            "id": sample_id,
+                            "source_index": source_index,
+                            "status": "error",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            def commit(
+                source_index: int,
+                sample_id: str,
+                trajectory: Mapping[str, Any],
+                route: str,
+            ) -> None:
+                nonlocal accepted
+                writer.append(trajectory)
                 error_ledger.resolve(sample_id=sample_id, source_index=source_index)
                 done.add(sample_id)
                 accepted += 1
@@ -644,6 +774,93 @@ def main() -> int:
                 if args.show_result:
                     summary["messages"] = trajectory["messages"]
                 print(compact_json(summary), flush=True)
+
+            def jobs() -> Iterator[tuple[int, str, ModelInput]]:
+                nonlocal attempted
+                for source_index, source_row in enumerate(iter_table_rows(selected)):
+                    if not owns_source_index(
+                        source_index,
+                        shard_index=args.shard_index,
+                        shard_count=args.shard_count,
+                    ):
+                        continue
+                    sample_id = str(
+                        source_row.get("id")
+                        or source_row.get("source_id")
+                        or f"source-index-{source_index}"
+                    )
+                    if sample_id in done:
+                        continue
+                    if args.max_samples is not None and attempted >= args.max_samples:
+                        break
+                    attempted += 1
+                    try:
+                        item = row_to_model_input(source_row)
+                        if item.input_kind in ORIGINAL_TRAJECTORY_KINDS:
+                            trajectory, route = _generate_one(
+                                item=item,
+                                source_index=source_index,
+                                args=args,
+                                client=probe_client,
+                                tokenizer=tokenizer,
+                                chat_kwargs=chat_kwargs,
+                                open_swe_store=open_swe_store,
+                                web_client=None,
+                                workspace_provider=workspace_provider,
+                            )
+                            commit(source_index, sample_id, trajectory, route)
+                            continue
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException as exc:
+                        record_error(source_index, sample_id, exc)
+                        continue
+                    yield source_index, sample_id, item
+
+            def generate(job: tuple[int, str, ModelInput]) -> tuple[dict[str, Any], str]:
+                source_index, _sample_id, item = job
+
+                def attempt() -> tuple[dict[str, Any], str]:
+                    web_enabled = args.web_tools_for_all or item.input_kind in set(
+                        args.web_input_kind
+                    )
+                    return _generate_one(
+                        item=item,
+                        source_index=source_index,
+                        args=args,
+                        client=chat_clients.get(),
+                        tokenizer=tokenizer,
+                        chat_kwargs=chat_kwargs,
+                        open_swe_store=None,
+                        web_client=(
+                            web_clients.get()
+                            if web_enabled and web_clients is not None
+                            else None
+                        ),
+                        workspace_provider=workspace_provider,
+                    )
+
+                return retry_call(
+                    attempt,
+                    retries=args.episode_retries,
+                    backoff_seconds=args.retry_backoff_seconds,
+                )
+
+            for job, future in bounded_completed_futures(
+                generate,
+                jobs(),
+                max_workers=args.workers,
+                max_pending=args.workers * 2,
+            ):
+                source_index, sample_id, _item = job
+                try:
+                    trajectory, route = future.result()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as exc:
+                    record_error(source_index, sample_id, exc)
+                    continue
+                commit(source_index, sample_id, trajectory, route)
 
             unresolved_ids = set(error_ledger.unresolved_ids)
 

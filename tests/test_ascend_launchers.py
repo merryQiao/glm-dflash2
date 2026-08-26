@@ -19,6 +19,12 @@ class AscendLauncherTest(unittest.TestCase):
         self.assertIn('--top-p "${TOP_P:-0.95}"', script)
         self.assertIn('--top-k "${TOP_K:--1}"', script)
 
+    def test_stage_a_uses_bounded_concurrency_defaults(self):
+        script = (ROOT / "scripts/run_stage_a_trajectories.sh").read_text()
+        self.assertIn('--workers "${WORKERS:-8}"', script)
+        self.assertIn('--max-running-requests "${MAX_RUNNING_REQUESTS:-2}"', script)
+        self.assertIn('--max-total-tokens "${MAX_TOTAL_TOKENS:-131072}"', script)
+
     def test_stage_b_launcher_passes_explicit_ascend_backend(self):
         script = (ROOT / "scripts/run_stage_b_hidden.sh").read_text()
         self.assertIn('--device "${DEVICE:-npu}"', script)

@@ -100,15 +100,94 @@ performs one finite optimizer update for DFlash, DFlash2 and DSpark.
 
 ## Production commands
 
-Generate trajectories:
+### Stage A — rollout trajectories
+
+For a large GLM-5.2 deployment, reuse its SGLang endpoint so this driver does
+not need to launch the multi-node service itself:
 
 ```bash
-MODEL_PATH=/shared/models/GLM-5.2-bf16 \
+cd /path/to/glm-dflash2
+
+MODEL_PATH=/shared/models/GLM-5.2 \
 ENDPOINT=http://glm52-sglang-service:30000 \
 SERVED_MODEL_NAME=GLM-5.2 \
-OUTPUT_JSONL=/shared/out/trajectories.jsonl \
+WORKSPACE_MAP=/shared/data/workspace_map.jsonl \
+WORKSPACE_CACHE=/shared/cache/vibe-workspaces \
+OPEN_SWE_STORE=/shared/data/open_swe_original.sqlite \
+OUTPUT_JSONL=/shared/out/trajectories-shard-0-of-1.jsonl \
 bash scripts/run_stage_a_trajectories.sh
 ```
+
+Stage A defaults to `WORKERS=8` trajectory workers but permits only
+`MAX_RUNNING_REQUESTS=2` concurrent model HTTP calls. Tool execution, Git,
+containers, and workspace preparation remain concurrent while the shared
+request semaphore bounds target KV/cache pressure even for an external
+endpoint. A local SGLang server additionally receives
+`--max-running-requests 2 --max-total-tokens 131072`. The latter two settings
+must also be configured on an independently launched external SGLang service;
+the client semaphore limits requests from this driver but cannot constrain
+other clients of that service.
+
+Start conservatively on a new Ascend deployment:
+
+```bash
+WORKERS=4 MAX_RUNNING_REQUESTS=1 MAX_TOTAL_TOKENS=131072 \
+MAX_SAMPLES=50 ... bash scripts/run_stage_a_trajectories.sh
+```
+
+Then use the default `8/2` profile only after checking peak HBM. Do not copy
+the Qwen3.8 reference's `12/8` profile to GLM-5.2 BF16 without a representative
+long-context load test. `EPISODE_RETRIES=2` retries an isolated workspace
+episode; only the main thread commits JSONL records and the error ledger, so a
+retry cannot produce duplicate committed IDs.
+
+`MODEL_PATH` is still required locally for the exact tokenizer/chat template.
+An external OpenAI endpoint exposes its served model name but not a weight
+digest, so the manifest records `weight_identity_verified=false`. Operational
+deployment must bind that endpoint to the same immutable model revision as
+`MODEL_PATH`; a local temporary server is fingerprint-verifiable.
+Repository-backed rows without a materialized workspace are hard errors; they
+are never silently converted into invented tool traces.
+
+The Stage A route behavior follows the specified SpecForge
+`vibe_coding_qwen38.py` pipeline:
+
+- repo references use cached Git mirrors and disposable worktrees;
+- executable-repo references use disposable containers;
+- `file_before_change` creates an isolated temporary repository;
+- Open-SWE prefix rows restore complete original trajectories from a read-only
+  SQLite store instead of inventing missing tool observations.
+
+Build that store once if the selected shard contains Open-SWE rows:
+
+```bash
+PYTHONPATH=src python tools/prepare_open_swe_trajectories.py \
+  --dataset data/vibe_coding_630k \
+  --output outputs/open_swe_original.sqlite
+```
+
+Then set `OPEN_SWE_STORE` and, if desired, `WORKSPACE_CACHE` in the Stage A
+command. Container execution remains sandboxed; host tests are disabled unless
+`ALLOW_HOST_TESTS=1` is explicitly set.
+
+Independent full model replicas can data-shard by stable selected-row index:
+
+```bash
+DATA_SHARD_COUNT=2 DATA_SHARD_INDEX=0 ... bash scripts/run_stage_a_trajectories.sh
+DATA_SHARD_COUNT=2 DATA_SHARD_INDEX=1 ... bash scripts/run_stage_a_trajectories.sh
+```
+
+Without `ENDPOINT`, the script launches a temporary local SGLang server using
+the GLM parsers `reasoning=glm45` and `tool-call=glm47`, then shuts it down
+before returning.
+
+The default generation policy is sampling, not greedy. To override it for an
+explicit ablation, set `TEMPERATURE`, `TOP_P`, and `TOP_K`; the exact values are
+part of the resume manifest and cannot silently change within a shard.
+
+For a production BF16 multi-node GLM service, the earlier `ENDPOINT=...` form
+is preferred: Stage A is only an OpenAI client and does not duplicate the
+target model.
 
 Extract both hidden streams with one target forward (run on every node with a
 different `NODE_RANK`):

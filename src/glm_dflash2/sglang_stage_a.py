@@ -25,6 +25,7 @@ class SGLangServerConfig:
     context_length: int = 131072
     mem_fraction_static: float = 0.9
     max_running_requests: int = 1
+    max_total_tokens: int | None = 131072
     reasoning_parser: str = "glm45"
     tool_call_parser: str = "glm47"
     quantization: str | None = None
@@ -70,6 +71,8 @@ def build_server_command(config: SGLangServerConfig) -> list[str]:
         "--log-level-http",
         "warning",
     ]
+    if config.max_total_tokens is not None:
+        command.extend(("--max-total-tokens", str(config.max_total_tokens)))
     if config.quantization:
         command.extend(("--quantization", config.quantization))
     if config.moe_a2a_backend:

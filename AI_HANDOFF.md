@@ -33,6 +33,64 @@ Stage A 默认 `temperature=1.0, top_p=0.95, top_k=-1`。Stage B 中用于构造
 旧 vLLM response-only 路径已经删除，不要恢复。Stage A、Stage B、tokenizer、
 embedding 和 LM head 必须来自同一不可变 GLM-5.2 BF16 revision。
 
+## Stage A：rollout trajectory
+
+主要文件：
+
+- `scripts/run_stage_a_trajectories.sh`
+- `tools/generate_trajectories.py`
+- `src/glm_dflash2/agent_trajectory.py`
+- `src/glm_dflash2/vibe_coding.py`
+- `src/glm_dflash2/workspaces.py`
+- `src/glm_dflash2/open_swe_trajectories.py`
+
+Stage A 不只是生成一段文本。它会：
+
+1. 读取 vibe-coding 数据并保留消息、tool schema 和任务类型；
+2. 对普通 repo/coding case 建立隔离 workspace，执行真实工具调用；
+3. 对 Open-SWE prefix 路由恢复原始完整 trajectory；
+4. 使用 GLM-5.2 sampling 进行多轮 agent rollout；
+5. 用同一 tokenizer/chat template 冻结完整 `input_ids`；
+6. 生成 target-token-position 语义的 `loss_mask`；
+7. 逐条 fsync，并通过 manifest 固定 resume contract。
+
+`loss_mask[i] = 1` 表示位置 `i` 是本次 rollout 中由 assistant 生成、允许作为训练
+目标的位置。System、user、历史上下文和 tool observation 为 0。该 mask 不是普通
+AR CE 的左移标签。
+
+输出 manifest 只有在 shard 所有 ID 都成功提交且没有 unresolved error 时才是
+`frozen`。`MAX_SAMPLES` smoke 生成的是 `partial`，不能冒充完整训练集。
+
+推荐复用已经部署好的 GLM-5.2 SGLang endpoint：
+
+```bash
+cd /path/to/glm-dflash2
+
+MODEL_PATH=/shared/models/GLM-5.2-bf16 \
+ENDPOINT=http://glm52-sglang-service:30000 \
+SERVED_MODEL_NAME=GLM-5.2 \
+WORKSPACE_MAP=/shared/data/workspace_map.jsonl \
+WORKSPACE_CACHE=/shared/cache/vibe-workspaces \
+OPEN_SWE_STORE=/shared/data/open_swe_original.sqlite \
+OUTPUT_JSONL=/shared/out/trajectories-shard-0-of-1.jsonl \
+bash scripts/run_stage_a_trajectories.sh
+```
+
+并发分为两层，不能混为一谈：
+
+- `WORKERS=8`：同时推进 trajectory、工具调用和 workspace 操作；
+- `MAX_RUNNING_REQUESTS=2`：通过进程内共享 semaphore 限制本脚本同时发出的模型
+  HTTP 请求；本地 SGLang 也收到同名限制；
+- `MAX_TOTAL_TOKENS=131072`：本地 SGLang 的聚合 token-pool 上限。
+
+第一次在新的 910B 环境上运行时先使用
+`WORKERS=4 MAX_RUNNING_REQUESTS=1 MAX_SAMPLES=50`，确认长上下文峰值 HBM 后再切到
+默认的 `8/2`。若 `ENDPOINT` 指向外部服务，本脚本无法修改外部服务自身的 token
+pool，也无法限制其他客户端；外部 SGLang 启动参数必须单独对齐。
+
+不要将 `TEMPERATURE=0` 作为默认值。若真实线上 GLM sampling policy 不是
+`1.0/0.95/-1`，应显式传入线上参数，并重新生成完整 shard。
+
 ## 固定模型契约
 
 ```text
@@ -52,6 +110,27 @@ block                       1 anchor + 15 mask positions
 
 一个 block 内的 16 个 local query 互相全可见；context 只包含 anchor 之前的真实
 prefix。位置 ID 是真实绝对位置，不允许重置成 0..15。
+
+## Stage B：hidden 提取
+
+主要文件：
+
+- `scripts/run_stage_b_hidden.sh`
+- `tools/extract_hidden_sglang.py`
+- `src/glm_dflash2/sglang_hidden_runner.py`
+- `src/glm_dflash2/hidden_extraction.py`
+- `src/glm_dflash2/hidden_cache.py`
+
+Stage B 使用独立、全新的 SGLang internal `ModelRunner`，沿 Stage A 已冻结的
+`input_ids` 做一次完整 teacher-forced prefill。
+
+固定 logical layer IDs 为 `[1,20,38,56,75]`。在当前 GLM/SGLang capture 语义中，
+对应 physical layer inputs `[2,21,39,57,76]`。兼容的 hook 名称为：
+
+```text
+auxiliary layers: model.model.layers_to_capture[physical_layer]
+final hidden:     model.model.norm.forward_output
+```
 
 ## Cache v2
 
