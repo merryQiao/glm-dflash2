@@ -96,3 +96,13 @@ class GLMDraftBackbone(nn.Module):
             )
         return self.norm(hidden_states)
 
+
+class DFlashDraftModel(GLMDraftBackbone):
+    """Plain DFlash consumer of the common five-layer GLM backbone."""
+
+    def __init__(self, config: Qwen3Config) -> None:
+        super().__init__(config, dynamic_convolution=False)
+        dflash = config.dflash_config
+        self.block_size = int(dflash["block_size"])
+        self.mask_token_id = int(dflash["mask_token_id"])
+        self.target_layer_ids = tuple(int(value) for value in dflash["target_layer_ids"])

@@ -6,11 +6,13 @@ from typing import Any, Mapping
 import torch
 from torch import nn
 
-from .chunked_lm_head import chunked_lm_projection
-from .dflash2_blocks import build_dflash_blocks, sample_anchor_positions
+from .chunked_lm_head import ChunkedLmProjection, chunked_lm_projection
 from .dflash2_model import Qwen3DFlash2DraftModel
 from .dflash2_objective import compute_acceptance_stats, compute_dflash2_loss
+from .dflash_blocks import DFlashBlocks, build_dflash_blocks, sample_anchor_positions
 from .distributed import global_weighted_mean
+from .draft_backbone import DFlashDraftModel
+from .method_objectives import depth_weighted_objective
 from .target_io import FrozenTargetIO, validate_cache_io_compatibility
 
 
@@ -41,24 +43,33 @@ class OfflineStepOutput:
     block_keep_mask: torch.Tensor
 
 
-class OfflineDFlash2Trainer(nn.Module):
-    """Trainable draft wrapper over frozen, non-registered target token I/O."""
+@dataclass(frozen=True)
+class _PreparedStep:
+    blocks: DFlashBlocks
+    pred_hidden: torch.Tensor
+    pred_targets: torch.Tensor
+    pred_mask: torch.Tensor
+    projection: ChunkedLmProjection
+
+
+class _OfflineDFlashBase(nn.Module):
+    """Shared cache, anchor, block, and frozen-I/O preparation."""
 
     def __init__(
         self,
-        draft_model: Qwen3DFlash2DraftModel,
+        draft_model: DFlashDraftModel | Qwen3DFlash2DraftModel,
         target_io: FrozenTargetIO,
         *,
         cache_manifest: Mapping[str, Any],
         num_anchors: int,
         gamma: float = 7.0,
-        selector_loss_weight: float = 1.0,
         token_chunk_size: int = 256,
         vocab_chunk_size: int = 4096,
-        anchor_seed: int = 1234,
+        global_seed: int = 1234,
+        anchor_seed: int | None = None,
     ) -> None:
         super().__init__()
-        if num_anchors < 1 or num_anchors > 64:
+        if not 1 <= int(num_anchors) <= 64:
             raise ValueError("num_anchors must be in [1, 64]")
         if token_chunk_size < 1 or vocab_chunk_size < 1:
             raise ValueError("projection chunk sizes must be positive")
@@ -72,8 +83,7 @@ class OfflineDFlash2Trainer(nn.Module):
         if int(target_io.manifest["hidden_size"]) != int(draft_model.config.hidden_size):
             raise ValueError("target I/O hidden size differs from draft config")
         self.draft_model = draft_model
-        # Frozen I/O is intentionally outside the registered module tree.  FSDP2,
-        # optimizers and sharded checkpoints therefore see only draft parameters.
+        # Keep the two huge frozen tensors out of FSDP/optimizer/checkpoints.
         object.__setattr__(self, "_target_io", target_io)
         object.__setattr__(
             self,
@@ -83,10 +93,12 @@ class OfflineDFlash2Trainer(nn.Module):
         self.cache_manifest = dict(cache_manifest)
         self.num_anchors = int(num_anchors)
         self.gamma = float(gamma)
-        self.selector_loss_weight = float(selector_loss_weight)
         self.token_chunk_size = int(token_chunk_size)
         self.vocab_chunk_size = int(vocab_chunk_size)
-        self.anchor_generator = torch.Generator(device="cpu").manual_seed(int(anchor_seed))
+        self.global_seed = int(global_seed if anchor_seed is None else anchor_seed)
+        # Legacy checkpoint entrypoints still serialize this object. Aligned
+        # anchor choice itself is pure and never consumes its state.
+        self.anchor_generator = torch.Generator(device="cpu").manual_seed(self.global_seed)
 
     @property
     def target_embed_weight(self) -> torch.Tensor:
@@ -101,36 +113,57 @@ class OfflineDFlash2Trainer(nn.Module):
         if current != self._frozen_io_versions:
             raise RuntimeError("frozen target token I/O was modified during training")
 
-    def forward(
+    def _anchors(
         self,
-        batch: Mapping[str, torch.Tensor],
+        batch: Mapping[str, Any],
         *,
-        anchor_positions: torch.Tensor | None = None,
-        block_keep_mask: torch.Tensor | None = None,
-    ) -> OfflineStepOutput:
+        epoch: int,
+        anchor_positions: torch.Tensor | None,
+        block_keep_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if anchor_positions is not None or block_keep_mask is not None:
+            if anchor_positions is None or block_keep_mask is None:
+                raise ValueError("anchor_positions and block_keep_mask must be supplied together")
+            return anchor_positions, block_keep_mask
+        sample_ids = batch.get("sample_id")
+        if not isinstance(sample_ids, (list, tuple)):
+            raise ValueError("automatic aligned anchor sampling requires batch sample_id")
+        return sample_anchor_positions(
+            batch["loss_mask"],
+            sample_ids=sample_ids,
+            global_seed=self.global_seed,
+            epoch=int(epoch),
+            attention_mask=batch.get("attention_mask"),
+            block_size=self.draft_model.block_size,
+            num_anchors=self.num_anchors,
+        )
+
+    def _prepare(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        top_k: int,
+        epoch: int,
+        anchor_positions: torch.Tensor | None,
+        block_keep_mask: torch.Tensor | None,
+    ) -> _PreparedStep:
+        self.assert_frozen_io_unchanged()
         input_ids = batch["input_ids"]
         loss_mask = batch["loss_mask"].to(torch.bool)
-        target_hidden = batch["hidden_states"]
-        if anchor_positions is None or block_keep_mask is None:
-            if anchor_positions is not None or block_keep_mask is not None:
-                raise ValueError("anchor_positions and block_keep_mask must be supplied together")
-            anchor_positions, block_keep_mask = sample_anchor_positions(
-                loss_mask,
-                attention_mask=batch.get("attention_mask"),
-                block_size=self.draft_model.block_size,
-                num_anchors=self.num_anchors,
-                generator=self.anchor_generator,
-            )
-
+        anchors, keep = self._anchors(
+            batch,
+            epoch=epoch,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+        )
         blocks = build_dflash_blocks(
             input_ids,
             loss_mask,
-            anchor_positions,
-            block_keep_mask,
+            anchors,
+            keep,
             attention_mask=batch.get("attention_mask"),
             block_size=self.draft_model.block_size,
             mask_token_id=self.draft_model.mask_token_id,
-            sliding_window=int(self.draft_model.config.sliding_window),
             attention_dtype=self.target_embed_weight.dtype,
         )
         if self.target_embed_weight.device != input_ids.device:
@@ -140,14 +173,12 @@ class OfflineDFlash2Trainer(nn.Module):
             position_ids=blocks.full_position_ids,
             attention_mask=blocks.attention_mask,
             noise_embedding=noise_embedding,
-            target_hidden=target_hidden.to(noise_embedding.dtype),
+            target_hidden=batch["hidden_states"].to(noise_embedding.dtype),
             conv_block_size=self.draft_model.block_size,
         )
-
         batch_size, num_blocks, block_size = blocks.target_ids.shape
-        hidden_size = output_hidden.shape[-1]
         pred_hidden = output_hidden.reshape(
-            batch_size, num_blocks, block_size, hidden_size
+            batch_size, num_blocks, block_size, output_hidden.shape[-1]
         )[:, :, 1:]
         pred_targets = blocks.target_ids[:, :, 1:]
         pred_mask = blocks.target_mask[:, :, 1:]
@@ -155,23 +186,131 @@ class OfflineDFlash2Trainer(nn.Module):
             pred_hidden,
             pred_targets,
             self.target_lm_head_weight,
-            top_k=self.draft_model.candidate_selector.top_k,
+            top_k=top_k,
             token_chunk_size=self.token_chunk_size,
             vocab_chunk_size=self.vocab_chunk_size,
             token_mask=pred_mask,
         )
+        return _PreparedStep(blocks, pred_hidden, pred_targets, pred_mask, projection)
+
+    @staticmethod
+    def _metrics(
+        prepared: _PreparedStep, selected_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        valid = prepared.pred_mask.to(torch.bool)
+        base_ids = prepared.projection.topk_ids[..., 0]
+        valid_tokens = valid.sum()
+        denominator = valid_tokens.clamp_min(1).float()
+        base_correct = ((base_ids == prepared.pred_targets) & valid).sum()
+        selected_correct = ((selected_ids == prepared.pred_targets) & valid).sum()
+        base_accept, base_accept_total, _ = compute_acceptance_stats(
+            base_ids, prepared.pred_targets, valid
+        )
+        selected_accept, selected_accept_total, valid_blocks = compute_acceptance_stats(
+            selected_ids, prepared.pred_targets, valid
+        )
+        return (
+            base_ids,
+            valid_tokens,
+            valid_blocks,
+            base_correct,
+            selected_correct,
+            base_correct.float() / denominator,
+            selected_correct.float() / denominator,
+            base_accept,
+            selected_accept,
+            base_accept_total,
+            selected_accept_total,
+        )
+
+
+class OfflineDFlashTrainer(_OfflineDFlashBase):
+    def forward(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        epoch: int = 0,
+        anchor_positions: torch.Tensor | None = None,
+        block_keep_mask: torch.Tensor | None = None,
+    ) -> OfflineStepOutput:
+        prepared = self._prepare(
+            batch,
+            top_k=1,
+            epoch=epoch,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+        )
+        terms = depth_weighted_objective(
+            prepared.projection.nll, prepared.pred_mask, gamma=self.gamma
+        )
+        base_loss = global_weighted_mean(terms.mean, terms.denominator)
+        selected_ids = prepared.projection.topk_ids[..., 0]
+        (
+            _, valid_tokens, valid_blocks, base_correct, selected_correct,
+            base_accuracy, selected_accuracy, base_accept, selected_accept,
+            base_accept_total, selected_accept_total,
+        ) = self._metrics(prepared, selected_ids)
+        zero = base_loss.detach() * 0.0
+        return OfflineStepOutput(
+            loss=base_loss,
+            base_loss=base_loss.detach(),
+            selector_loss=zero,
+            base_accuracy=base_accuracy.detach(),
+            selector_accuracy=selected_accuracy.detach(),
+            base_accept_len=base_accept.detach(),
+            selector_accept_len=selected_accept.detach(),
+            candidate_recall=base_accuracy.detach(),
+            valid_tokens=valid_tokens.detach(),
+            valid_blocks=valid_blocks.detach(),
+            loss_weight=terms.denominator.detach(),
+            base_numerator=terms.numerator.detach(),
+            base_denominator=terms.denominator.detach(),
+            selector_numerator=zero,
+            selector_denominator=zero,
+            base_correct=base_correct.detach(),
+            selector_correct=selected_correct.detach(),
+            base_accept_total=base_accept_total.detach(),
+            selector_accept_total=selected_accept_total.detach(),
+            candidate_hits=base_correct.detach(),
+            candidate_total=valid_tokens.detach(),
+            anchor_positions=prepared.blocks.anchor_positions.detach(),
+            block_keep_mask=prepared.blocks.block_keep_mask.detach(),
+        )
+
+
+class OfflineDFlash2Trainer(_OfflineDFlashBase):
+    def __init__(self, *args: Any, selector_loss_weight: float = 1.0, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.selector_loss_weight = float(selector_loss_weight)
+
+    def forward(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        epoch: int = 0,
+        anchor_positions: torch.Tensor | None = None,
+        block_keep_mask: torch.Tensor | None = None,
+    ) -> OfflineStepOutput:
+        top_k = self.draft_model.candidate_selector.top_k
+        prepared = self._prepare(
+            batch,
+            top_k=top_k,
+            epoch=epoch,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+        )
         selector_scores = self.draft_model.candidate_selector(
-            pred_hidden,
-            projection.topk_scores,
-            projection.topk_ids,
-            blocks.target_ids[:, :, :-1],
+            prepared.pred_hidden,
+            prepared.projection.topk_scores,
+            prepared.projection.topk_ids,
+            prepared.blocks.target_ids[:, :, :-1],
         )
         losses = compute_dflash2_loss(
-            base_nll=projection.nll,
-            candidate_ids=projection.topk_ids,
+            base_nll=prepared.projection.nll,
+            candidate_ids=prepared.projection.topk_ids,
             selector_scores=selector_scores,
-            target_ids=blocks.target_ids,
-            pred_mask=pred_mask,
+            target_ids=prepared.blocks.target_ids,
+            pred_mask=prepared.pred_mask,
             gamma=self.gamma,
             selector_loss_weight=self.selector_loss_weight,
         )
@@ -180,27 +319,15 @@ class OfflineDFlash2Trainer(nn.Module):
             losses.selector_loss, losses.selector_denominator
         )
         training_loss = base_loss + self.selector_loss_weight * selector_loss
-
-        with torch.no_grad():
-            valid = pred_mask.to(torch.bool)
-            base_ids = projection.topk_ids[..., 0]
-            selected_ids = projection.topk_ids.gather(
-                -1, selector_scores.argmax(dim=-1, keepdim=True)
-            ).squeeze(-1)
-            valid_tokens = valid.sum()
-            denominator = valid_tokens.clamp_min(1).float()
-            base_correct = ((base_ids == pred_targets) & valid).sum()
-            selector_correct = ((selected_ids == pred_targets) & valid).sum()
-            base_accuracy = base_correct.float() / denominator
-            selector_accuracy = selector_correct.float() / denominator
-            base_accept, base_accept_total, _ = compute_acceptance_stats(
-                base_ids, pred_targets, valid
-            )
-            selector_accept, selector_accept_total, valid_blocks = compute_acceptance_stats(
-                selected_ids, pred_targets, valid
-            )
-            candidate_recall = losses.candidate_hits.float() / losses.candidate_total.clamp_min(1).float()
-
+        selected_ids = prepared.projection.topk_ids.gather(
+            -1, selector_scores.argmax(dim=-1, keepdim=True)
+        ).squeeze(-1)
+        (
+            _, valid_tokens, valid_blocks, base_correct, selector_correct,
+            base_accuracy, selector_accuracy, base_accept, selector_accept,
+            base_accept_total, selector_accept_total,
+        ) = self._metrics(prepared, selected_ids)
+        candidate_recall = losses.candidate_hits.float() / losses.candidate_total.clamp_min(1).float()
         return OfflineStepOutput(
             loss=training_loss,
             base_loss=base_loss.detach(),
@@ -223,6 +350,6 @@ class OfflineDFlash2Trainer(nn.Module):
             selector_accept_total=selector_accept_total.detach(),
             candidate_hits=losses.candidate_hits,
             candidate_total=losses.candidate_total,
-            anchor_positions=blocks.anchor_positions.detach(),
-            block_keep_mask=blocks.block_keep_mask.detach(),
+            anchor_positions=prepared.blocks.anchor_positions.detach(),
+            block_keep_mask=prepared.blocks.block_keep_mask.detach(),
         )

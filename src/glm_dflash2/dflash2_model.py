@@ -395,26 +395,42 @@ class Qwen3DFlash2DraftModel(nn.Module):
 
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
+        # Imported lazily because draft_backbone reuses the layer primitives
+        # defined in this module.
+        from .draft_backbone import GLMDraftBackbone
+
         self.config = config
         dflash = config.dflash_config
         self.block_size = int(dflash["block_size"])
         self.mask_token_id = int(dflash["mask_token_id"])
         self.target_layer_ids = tuple(int(value) for value in dflash["target_layer_ids"])
-        self.layers = nn.ModuleList(
-            [DFlash2DecoderLayer(config, index) for index in range(config.num_hidden_layers)]
-        )
-        self.norm = DFlashRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.rotary_emb = DFlashRotaryEmbedding(config.head_dim, config.rope_theta)
-        self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False
-        )
-        self.hidden_norm = DFlashRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.backbone = GLMDraftBackbone(config, dynamic_convolution=True)
         self.candidate_selector = CandidateSelector(
             config.vocab_size,
             config.hidden_size,
             int(dflash["selector_rank"]),
             int(dflash["selector_top_k"]),
         )
+
+    @property
+    def layers(self) -> nn.ModuleList:
+        return self.backbone.layers
+
+    @property
+    def norm(self) -> DFlashRMSNorm:
+        return self.backbone.norm
+
+    @property
+    def rotary_emb(self) -> DFlashRotaryEmbedding:
+        return self.backbone.rotary_emb
+
+    @property
+    def fc(self) -> nn.Linear:
+        return self.backbone.fc
+
+    @property
+    def hidden_norm(self) -> DFlashRMSNorm:
+        return self.backbone.hidden_norm
 
     def resolve_conv_block_size(self, query_length: int, explicit: int | None) -> int:
         block_size = self.block_size if explicit is None else int(explicit)
@@ -423,12 +439,7 @@ class Qwen3DFlash2DraftModel(nn.Module):
         return block_size
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = self.fc.in_features
-        if target_hidden.ndim != 3 or target_hidden.shape[-1] != expected:
-            raise ValueError(
-                f"target_hidden must have shape [batch, tokens, {expected}], got {tuple(target_hidden.shape)}"
-            )
-        return self.hidden_norm(self.fc(target_hidden))
+        return self.backbone.project_target_hidden(target_hidden)
 
     def forward(
         self,
@@ -441,19 +452,11 @@ class Qwen3DFlash2DraftModel(nn.Module):
     ) -> torch.Tensor:
         if noise_embedding.ndim != 3:
             raise ValueError("noise_embedding must have shape [batch, draft, hidden]")
-        projected_target = self.project_target_hidden(target_hidden)
-        expected_positions = projected_target.shape[1] + noise_embedding.shape[1]
-        if position_ids.shape != (noise_embedding.shape[0], expected_positions):
-            raise ValueError("position_ids do not cover [context | noise]")
         block_size = self.resolve_conv_block_size(noise_embedding.shape[1], conv_block_size)
-        position_embeddings = self.rotary_emb(noise_embedding, position_ids)
-        hidden_states = noise_embedding
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states,
-                projected_target,
-                attention_mask,
-                position_embeddings,
-                block_size,
-            )
-        return self.norm(hidden_states)
+        return self.backbone(
+            position_ids=position_ids,
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+            attention_mask=attention_mask,
+            conv_block_size=block_size,
+        )

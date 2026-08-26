@@ -11,6 +11,7 @@ from glm_dflash2.dflash2_model import (
     build_dflash2_config,
     build_glm52_dflash2_config,
 )
+from glm_dflash2.draft_backbone import GLMDraftBackbone
 
 
 class DFlash2ModelTest(unittest.TestCase):
@@ -92,6 +93,7 @@ class DFlash2ModelTest(unittest.TestCase):
             sliding_window=32,
         )
         model = Qwen3DFlash2DraftModel(config)
+        self.assertIsInstance(model.backbone, GLMDraftBackbone)
         target_hidden = torch.randn(2, 6, 32)
         noise = torch.randn(2, 8, 16, requires_grad=True)
         positions = torch.cat(

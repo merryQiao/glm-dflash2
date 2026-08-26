@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from .method_objectives import depth_weighted_objective, depth_weights
+
 
 @dataclass(frozen=True)
 class DFlash2Loss:
@@ -35,14 +37,6 @@ def selector_supervision(
     return slots, hit
 
 
-def _depth_weights(reference: torch.Tensor, gamma: float) -> torch.Tensor:
-    if gamma <= 0:
-        raise ValueError("gamma must be positive")
-    depth = torch.arange(reference.shape[-1], device=reference.device, dtype=torch.float32)
-    shape = (1,) * (reference.ndim - 1) + (reference.shape[-1],)
-    return torch.exp(-depth / float(gamma)).reshape(shape)
-
-
 def compute_dflash2_loss(
     *,
     base_nll: torch.Tensor,
@@ -63,13 +57,11 @@ def compute_dflash2_loss(
         raise ValueError("selector_scores and candidate_ids shapes differ")
 
     mask = pred_mask.to(device=base_nll.device, dtype=torch.float32)
-    weights = mask * _depth_weights(base_nll, gamma)
-    base_numerator = (base_nll.float() * weights).sum()
-    base_denominator = weights.sum()
-    if bool(base_denominator > 0):
-        base_loss = base_numerator / base_denominator
-    else:
-        base_loss = base_nll.sum() * 0.0
+    base = depth_weighted_objective(base_nll, pred_mask, gamma=gamma)
+    weights = mask * depth_weights(base_nll, gamma)
+    base_numerator = base.numerator
+    base_denominator = base.denominator
+    base_loss = base.mean
 
     slots, hit = selector_supervision(candidate_ids, target_ids)
     selector_weights = weights * hit.to(weights.dtype)
