@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -48,8 +49,8 @@ class DSparkModelTest(unittest.TestCase):
             head.markov_w1.weight[2] = torch.tensor([1.0, 2.0])
             head.markov_w2.weight[3] = torch.tensor([4.0, 5.0])
         predecessor = torch.tensor([2])
-        first = head.score_chunk(torch.tensor([[2.0, 3.0, 0.0]]), predecessor, 0, 5)
-        second = head.score_chunk(torch.tensor([[-7.0, 9.0, 4.0]]), predecessor, 0, 5)
+        first = head(predecessor, 0, 5)
+        second = head(predecessor, 0, 5)
         self.assertEqual(tuple(first.shape), (1, 5))
         self.assertAlmostEqual(first[0, 3].item(), 14.0)
         torch.testing.assert_close(first, second)
@@ -67,6 +68,21 @@ class DSparkModelTest(unittest.TestCase):
         high = model.confidence_logits(hidden, torch.tensor([[2]]))
         self.assertAlmostEqual(low.item(), 0.0)
         self.assertAlmostEqual(high.item(), 2.0)
+
+    def test_confidence_materializes_markov_features_through_module_forward(self):
+        model = DSparkDraftModel(self._config(), markov_rank=4)
+        hidden = torch.zeros(1, 2, 8)
+        predecessors = torch.tensor([[1, 2]])
+        original = model.markov_head.forward
+
+        with mock.patch.object(
+            model.markov_head, "forward", wraps=original
+        ) as routed_forward:
+            model.confidence_logits(hidden, predecessors)
+
+        routed_forward.assert_called_once()
+        self.assertIs(routed_forward.call_args.args[0], predecessors)
+        self.assertEqual(routed_forward.call_args.kwargs, {})
 
     def test_head_initialization_uses_model_initializer_range(self):
         torch.manual_seed(123)

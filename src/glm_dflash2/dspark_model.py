@@ -31,38 +31,28 @@ class LowRankMarkovHead(nn.Module):
         nn.init.normal_(self.markov_w1.weight, mean=0.0, std=initializer_range)
         nn.init.normal_(self.markov_w2.weight, mean=0.0, std=initializer_range)
 
-    def get_prev_embeddings(self, predecessor_ids: torch.Tensor) -> torch.Tensor:
-        return self.markov_w1(predecessor_ids.to(torch.long))
-
-    def score_chunk(
-        self,
-        hidden: torch.Tensor,
-        predecessor_ids: torch.Tensor,
-        vocab_start: int,
-        vocab_end: int,
-    ) -> torch.Tensor:
-        if not 0 <= int(vocab_start) < int(vocab_end) <= self.vocab_size:
-            raise ValueError("invalid vocabulary chunk")
-        if predecessor_ids.shape != hidden.shape[:-1]:
-            raise ValueError("predecessor_ids must match hidden token dimensions")
-        predecessor = self.get_prev_embeddings(predecessor_ids)
-        successor = self.markov_w2.weight[int(vocab_start) : int(vocab_end)]
-        return torch.einsum("...r,vr->...v", predecessor, successor)
-
     def forward(
         self,
-        hidden: torch.Tensor,
         predecessor_ids: torch.Tensor,
-        vocab_start: int,
-        vocab_end: int,
+        vocab_start: int | None = None,
+        vocab_end: int | None = None,
     ) -> torch.Tensor:
-        """Score one vocabulary chunk through ``nn.Module.__call__``.
+        """Return predecessor features or score one vocabulary chunk.
 
-        This is deliberately a real ``forward`` so FSDP2 hooks can materialize
-        the head when it is invoked after the common backbone forward.
+        Both routes deliberately pass through ``nn.Module.__call__`` so FSDP2
+        can materialize the independently sharded head.  Direct parameter
+        access after the common backbone forward is not safe under FSDP2.
         """
 
-        return self.score_chunk(hidden, predecessor_ids, vocab_start, vocab_end)
+        predecessor = self.markov_w1(predecessor_ids.to(torch.long))
+        if vocab_start is None and vocab_end is None:
+            return predecessor
+        if vocab_start is None or vocab_end is None:
+            raise ValueError("vocab_start and vocab_end must be provided together")
+        if not 0 <= int(vocab_start) < int(vocab_end) <= self.vocab_size:
+            raise ValueError("invalid vocabulary chunk")
+        successor = self.markov_w2.weight[int(vocab_start) : int(vocab_end)]
+        return torch.einsum("...r,vr->...v", predecessor, successor)
 
 
 class DSparkDraftModel(DFlashDraftModel):
@@ -97,8 +87,6 @@ class DSparkDraftModel(DFlashDraftModel):
     ) -> torch.Tensor:
         if predecessor_ids.shape != hidden_states.shape[:-1]:
             raise ValueError("predecessor_ids must match hidden token dimensions")
-        markov_embedding = self.markov_head.get_prev_embeddings(predecessor_ids).to(
-            hidden_states.dtype
-        )
+        markov_embedding = self.markov_head(predecessor_ids).to(hidden_states.dtype)
         features = torch.cat((hidden_states, markov_embedding), dim=-1)
         return self.confidence_head(features).squeeze(-1)

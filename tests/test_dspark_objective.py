@@ -76,8 +76,8 @@ class DSparkObjectiveTest(unittest.TestCase):
         flat_draft = draft.reshape(-1, 4)
         flat_teacher = teacher.reshape(-1, 4)
         dense_draft = torch.mm(flat_draft, weight.T).float()
-        dense_draft = dense_draft + markov.score_chunk(
-            flat_draft, predecessors.reshape(-1), 0, 5
+        dense_draft = dense_draft + markov(
+            predecessors.reshape(-1), 0, 5
         ).float()
         dense_teacher = torch.mm(flat_teacher, weight.T).float()
         q = dense_draft.softmax(-1)
@@ -119,7 +119,7 @@ class DSparkObjectiveTest(unittest.TestCase):
         original = markov.forward
 
         def remember(*args, **kwargs):
-            calls.append((args[2], args[3]))
+            calls.append((args[1], args[2]))
             return original(*args, **kwargs)
 
         with mock.patch.object(markov, "forward", side_effect=remember):

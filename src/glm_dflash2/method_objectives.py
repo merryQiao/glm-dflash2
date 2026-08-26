@@ -133,7 +133,7 @@ def compute_dspark_loss(
         hidden: torch.Tensor, start: int, end: int
     ) -> torch.Tensor:
         logits = _bf16_mm(hidden, lm_head_weight[start:end]).float()
-        bias = markov_head(hidden, flat_predecessors, start, end)
+        bias = markov_head(flat_predecessors, start, end)
         return logits + bias.float()
 
     def teacher_chunk(start: int, end: int) -> torch.Tensor:
