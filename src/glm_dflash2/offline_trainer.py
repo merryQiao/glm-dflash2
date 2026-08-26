@@ -71,6 +71,7 @@ class OfflineDSparkStepOutput:
     accept_len: torch.Tensor
     valid_tokens: torch.Tensor
     valid_blocks: torch.Tensor
+    loss_weight: torch.Tensor
     ce_numerator: torch.Tensor
     ce_denominator: torch.Tensor
     l1_numerator: torch.Tensor
@@ -407,7 +408,9 @@ class OfflineDFlash2Trainer(_OfflineDFlashBase):
         selector_loss = global_weighted_mean(
             losses.selector_loss, losses.selector_denominator
         )
-        training_loss = base_loss + self.selector_loss_weight * selector_loss
+        training_loss = global_weighted_mean(
+            losses.loss, losses.base_denominator
+        )
         selected_ids = prepared.projection.topk_ids.gather(
             -1, selector_scores.argmax(dim=-1, keepdim=True)
         ).squeeze(-1)
@@ -531,6 +534,7 @@ class OfflineDSparkTrainer(_OfflineDFlashBase):
             accept_len=accept_len.detach(),
             valid_tokens=valid_tokens.detach(),
             valid_blocks=valid_blocks.detach(),
+            loss_weight=losses.ce.denominator.detach(),
             ce_numerator=losses.ce.numerator.detach(),
             ce_denominator=losses.ce.denominator.detach(),
             l1_numerator=losses.l1.numerator.detach(),

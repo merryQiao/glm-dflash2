@@ -80,7 +80,12 @@ def compute_dflash2_loss(
     selector_denominator = selector_weights.sum()
     # Keep a differentiable zero when a microbatch has no target in top-k.
     selector_loss = selector_numerator / (selector_denominator + 1e-6)
-    total = base_loss + float(selector_loss_weight) * selector_loss
+    # Base and selector terms share one token-position denominator.  This
+    # makes the total a true additive objective across uneven microbatches;
+    # selector misses contribute zero instead of changing the normalization.
+    total = (
+        base_numerator + float(selector_loss_weight) * selector_numerator
+    ) / base_denominator.clamp_min(1.0)
     valid = mask > 0
     return DFlash2Loss(
         loss=total,

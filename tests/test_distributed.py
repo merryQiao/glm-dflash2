@@ -13,6 +13,7 @@ from glm_dflash2.distributed import (
     rank_epoch_seed,
     resolve_device_backend,
     reduce_additive_metrics,
+    scale_loss_for_accumulation,
 )
 
 
@@ -90,6 +91,28 @@ class DistributedTest(unittest.TestCase):
         self.assertEqual(scaled.item(), 1.5)
         scaled.backward()
         self.assertEqual(local_mean.grad.item(), 0.5)
+
+    def test_weighted_accumulation_matches_one_concatenated_batch(self):
+        accumulated = torch.tensor(0.7, requires_grad=True)
+        reference = accumulated.detach().clone().requires_grad_(True)
+        total_weight = torch.zeros(())
+        batches = (
+            (torch.tensor([1.0]), torch.tensor([0.0])),
+            (torch.tensor([2.0, 3.0, 4.0]), torch.tensor([1.0, 1.0, 2.0])),
+        )
+        for inputs, targets in batches:
+            losses = (accumulated * inputs - targets).square()
+            weight = torch.tensor(losses.numel())
+            mean = global_weighted_mean(losses.mean(), weight)
+            numerator_loss, denominator = scale_loss_for_accumulation(mean, weight)
+            numerator_loss.backward()
+            total_weight += denominator
+        accumulated.grad.div_(total_weight)
+
+        all_inputs = torch.cat([value[0] for value in batches])
+        all_targets = torch.cat([value[1] for value in batches])
+        (reference * all_inputs - all_targets).square().mean().backward()
+        torch.testing.assert_close(accumulated.grad, reference.grad)
 
 
 if __name__ == "__main__":

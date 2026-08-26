@@ -84,6 +84,7 @@ class DSparkTrainerTest(unittest.TestCase):
         trainer, batch, anchors, keep = self._fixture()
         output = trainer(batch, anchor_positions=anchors, block_keep_mask=keep)
         self.assertTrue(torch.isfinite(output.loss))
+        self.assertGreater(output.loss_weight.item(), 0)
         self.assertGreater(output.valid_tokens.item(), 0)
         output.loss.backward()
         self.assertTrue(any(p.grad is not None for p in trainer.draft_model.layers.parameters()))

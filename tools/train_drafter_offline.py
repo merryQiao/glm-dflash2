@@ -31,6 +31,7 @@ from glm_dflash2.distributed import (
     initialize_distributed,
     rank_epoch_seed,
     reduce_additive_metrics,
+    scale_loss_for_accumulation,
     shutdown_distributed,
 )
 from glm_dflash2.draft_backbone import DFlashDraftModel
@@ -438,6 +439,7 @@ def main(argv: list[str] | None = None, *, default_method: str | None = None) ->
             log_handle = (output_dir / "train.jsonl").open("a", encoding="utf-8")
 
         accumulation = 0
+        accumulation_weight = torch.zeros((), device=context.device, dtype=torch.float32)
         metric_accumulator: dict[str, torch.Tensor] = {}
         stop = False
         for epoch in range(progress.epoch, args.epochs):
@@ -478,15 +480,24 @@ def main(argv: list[str] | None = None, *, default_method: str | None = None) ->
                     )
                 if not bool(torch.isfinite(step.loss)):
                     raise FloatingPointError("non-finite training loss")
-                step.loss.backward()
+                numerator_loss, global_loss_weight = scale_loss_for_accumulation(
+                    step.loss, step.loss_weight
+                )
+                numerator_loss.backward()
+                accumulation_weight = accumulation_weight + global_loss_weight
                 if contributes:
                     accumulation += 1
                     _add_metrics(metric_accumulator, _step_metrics(args.method, step))
                 global_step = progress.global_step
                 if should_step:
+                    denominator_value = float(accumulation_weight.item())
+                    if denominator_value <= 0:
+                        raise RuntimeError("optimizer step has zero accumulated loss weight")
                     for parameter in trainer.parameters():
                         if parameter.grad is not None:
-                            parameter.grad.div_(accumulation)
+                            # A Python scalar is valid for both local Tensor and
+                            # FSDP2 DTensor gradients; a local tensor divisor is not.
+                            parameter.grad.div_(denominator_value)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         list(trainer.parameters()), args.max_grad_norm
                     )
@@ -496,6 +507,7 @@ def main(argv: list[str] | None = None, *, default_method: str | None = None) ->
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     accumulation = 0
+                    accumulation_weight.zero_()
                     global_step += 1
                 progress = TrainingProgress(
                     global_step, progress.micro_step + 1, epoch, batch_index + 1

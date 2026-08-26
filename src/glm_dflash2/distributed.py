@@ -140,13 +140,9 @@ def global_weighted_mean(
     averages gradients across ranks, hence the explicit world-size factor.
     """
 
-    global_weight = local_weight.detach().to(
-        device=local_mean.device, dtype=torch.float32
-    ).clone()
-    world_size = 1
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        world_size = dist.get_world_size()
-        dist.all_reduce(global_weight, op=dist.ReduceOp.SUM)
+    global_weight, world_size = _global_weight(
+        local_weight, device=local_mean.device
+    )
     if not bool(global_weight > 0):
         return local_mean * 0.0
     scale = (
@@ -155,6 +151,40 @@ def global_weighted_mean(
         / global_weight
     )
     return local_mean * scale.to(dtype=local_mean.dtype)
+
+
+def _global_weight(
+    local_weight: torch.Tensor, *, device: torch.device
+) -> tuple[torch.Tensor, int]:
+    global_weight = local_weight.detach().to(device=device, dtype=torch.float32).clone()
+    world_size = 1
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        world_size = dist.get_world_size()
+        dist.all_reduce(global_weight, op=dist.ReduceOp.SUM)
+    return global_weight, world_size
+
+
+def scale_loss_for_accumulation(
+    globally_normalized_loss: torch.Tensor,
+    local_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recover an additive numerator loss for exact gradient accumulation.
+
+    ``global_weighted_mean`` accounts for gradient averaging across ranks.  By
+    multiplying that loss by the global denominator, each backward contributes
+    an unnormalized global numerator.  The caller divides gradients once by
+    the sum of returned denominators at the optimizer boundary.
+    """
+
+    global_weight, _ = _global_weight(
+        local_weight, device=globally_normalized_loss.device
+    )
+    if not bool(global_weight > 0):
+        return globally_normalized_loss * 0.0, global_weight
+    return (
+        globally_normalized_loss * global_weight.to(globally_normalized_loss.dtype),
+        global_weight,
+    )
 
 
 def distributed_any(value: bool, device: torch.device) -> bool:

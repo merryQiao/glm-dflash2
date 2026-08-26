@@ -37,9 +37,12 @@ class DFlash2ObjectiveTest(unittest.TestCase):
         nll0 = F.cross_entropy(torch.tensor([[2.0, 0.0]]), torch.tensor([0])).item()
         nll1 = F.cross_entropy(torch.tensor([[3.0, 1.0]]), torch.tensor([1])).item()
         expected_selector = (nll0 * w0 + nll1 * w1) / (w0 + w1 + 1e-6)
+        expected_total = (
+            1.0 * w0 + 2.0 * w1 + nll0 * w0 + nll1 * w1
+        ) / (w0 + w1)
         self.assertAlmostEqual(out.base_loss.item(), expected_base, places=6)
         self.assertAlmostEqual(out.selector_loss.item(), expected_selector, places=6)
-        self.assertAlmostEqual(out.loss.item(), expected_base + expected_selector, places=6)
+        self.assertAlmostEqual(out.loss.item(), expected_total, places=6)
 
     def test_missing_true_candidates_have_zero_selector_signal(self):
         out = compute_dflash2_loss(
@@ -53,6 +56,28 @@ class DFlash2ObjectiveTest(unittest.TestCase):
         self.assertEqual(out.selector_loss.item(), 0.0)
         self.assertEqual(out.candidate_hits.item(), 0)
         self.assertEqual(out.candidate_total.item(), 2)
+
+    def test_total_loss_uses_one_common_token_denominator(self):
+        base_nll = torch.tensor([[[1.0, 3.0]]], requires_grad=True)
+        candidate_ids = torch.tensor([[[[2, 9], [7, 8]]]])
+        selector_scores = torch.tensor(
+            [[[[2.0, 0.0], [1.0, -1.0]]]], requires_grad=True
+        )
+        out = compute_dflash2_loss(
+            base_nll=base_nll,
+            candidate_ids=candidate_ids,
+            selector_scores=selector_scores,
+            target_ids=torch.tensor([[[1, 2, 3]]]),
+            pred_mask=torch.ones(1, 1, 2),
+            gamma=2.0,
+        )
+        w0, w1 = 1.0, math.exp(-0.5)
+        base_numerator = 1.0 * w0 + 3.0 * w1
+        selector_numerator = F.cross_entropy(
+            torch.tensor([[2.0, 0.0]]), torch.tensor([0])
+        ).item() * w0
+        expected = (base_numerator + selector_numerator) / (w0 + w1)
+        self.assertAlmostEqual(out.loss.item(), expected, places=6)
 
     def test_masked_negative_infinity_candidates_do_not_create_nan(self):
         selector_scores = torch.tensor(
