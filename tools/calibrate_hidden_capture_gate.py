@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 
-CAPTURE_KEYS = ("aux_hidden_states", "target_final_hidden")
+CAPTURE_KEYS = ("aux_hidden_states", "target_final_hidden", "target_logits")
 METRIC_KEYS = ("cosine_error", "max_abs_error", "mean_abs_error")
 IDENTITY_KEYS = (
     "target_fingerprint",
@@ -36,6 +36,57 @@ def _capture_vector(capture: Mapping[str, torch.Tensor]) -> torch.Tensor:
     return torch.cat(tensors)
 
 
+def _capture_streams(capture: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    missing = [key for key in CAPTURE_KEYS if key not in capture]
+    if missing:
+        raise ValueError(f"capture is missing {', '.join(missing)}")
+    aux = torch.as_tensor(capture["aux_hidden_states"]).detach().cpu().float()
+    if aux.ndim < 2:
+        raise ValueError("aux_hidden_states must expose a layer axis")
+    values = {
+        f"aux_hidden_states.layer_{index}": aux.select(-2, index)
+        for index in range(aux.shape[-2])
+    }
+    values["target_final_hidden"] = (
+        torch.as_tensor(capture["target_final_hidden"]).detach().cpu().float()
+    )
+    values["target_logits"] = (
+        torch.as_tensor(capture["target_logits"]).detach().cpu().float()
+    )
+    for name, value in values.items():
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError(f"capture {name} contains NaN or Inf")
+    return values
+
+
+def _tensor_error_metrics(left: torch.Tensor, right: torch.Tensor) -> dict[str, float]:
+    if tuple(left.shape) != tuple(right.shape):
+        raise ValueError("capture stream shape differs")
+    left = left.reshape(-1)
+    right = right.reshape(-1)
+    if not bool(left.norm() > 0) or not bool(right.norm() > 0):
+        raise ValueError("cosine parity requires non-zero captures")
+    absolute = (left - right).abs()
+    cosine_error = 1.0 - float(F.cosine_similarity(left[None], right[None]).item())
+    return {
+        "cosine_error": max(0.0, cosine_error),
+        "max_abs_error": float(absolute.max().item()),
+        "mean_abs_error": float(absolute.mean().item()),
+    }
+
+
+def capture_stream_error_metrics(
+    reference: Mapping[str, torch.Tensor], candidate: Mapping[str, torch.Tensor]
+) -> dict[str, dict[str, float]]:
+    left = _capture_streams(reference)
+    right = _capture_streams(candidate)
+    if tuple(left) != tuple(right):
+        raise ValueError("capture stream sets differ")
+    return {
+        name: _tensor_error_metrics(left[name], right[name]) for name in left
+    }
+
+
 def capture_error_metrics(
     reference: Mapping[str, torch.Tensor], candidate: Mapping[str, torch.Tensor]
 ) -> dict[str, float]:
@@ -46,17 +97,7 @@ def capture_error_metrics(
             torch.as_tensor(candidate[key]).shape
         ):
             raise ValueError(f"capture shape differs for {key}")
-    left = _capture_vector(reference)
-    right = _capture_vector(candidate)
-    if not bool(left.norm() > 0) or not bool(right.norm() > 0):
-        raise ValueError("cosine parity requires non-zero captures")
-    absolute = (left - right).abs()
-    cosine_error = 1.0 - float(F.cosine_similarity(left[None], right[None]).item())
-    return {
-        "cosine_error": max(0.0, cosine_error),
-        "max_abs_error": float(absolute.max().item()),
-        "mean_abs_error": float(absolute.mean().item()),
-    }
+    return _tensor_error_metrics(_capture_vector(reference), _capture_vector(candidate))
 
 
 def _validated_identity(identity: Mapping[str, Any]) -> dict[str, str]:
@@ -85,34 +126,43 @@ def calibrate_parity_gate(
     for left_index in range(len(direct_runs)):
         for right_index in range(left_index + 1, len(direct_runs)):
             direct_metrics.append(
-                capture_error_metrics(direct_runs[left_index], direct_runs[right_index])
+                capture_stream_error_metrics(
+                    direct_runs[left_index], direct_runs[right_index]
+                )
             )
     controls = {
-        name: capture_error_metrics(direct_runs[0], capture)
+        name: capture_stream_error_metrics(direct_runs[0], capture)
         for name, capture in negative_controls.items()
     }
-    metrics: dict[str, Any] = {}
-    for name in METRIC_KEYS:
-        worst = max(value[name] for value in direct_metrics)
-        floor = float(floors[name])
-        bound = max(floor, 2.0 * worst)
-        negative = {key: value[name] for key, value in controls.items()}
-        if any(bound >= error for error in negative.values()):
-            raise ValueError(
-                f"{name} bound is not strictly below every negative control error"
-            )
-        metrics[name] = {
-            "floor": floor,
-            "worst_direct_variation": worst,
-            "bound": bound,
-            "negative_controls": negative,
-        }
+    streams: dict[str, Any] = {}
+    for stream_name in direct_metrics[0]:
+        metrics: dict[str, Any] = {}
+        for metric_name in METRIC_KEYS:
+            worst = max(value[stream_name][metric_name] for value in direct_metrics)
+            floor = float(floors[metric_name])
+            bound = max(floor, 2.0 * worst)
+            negative = {
+                key: value[stream_name][metric_name] for key, value in controls.items()
+            }
+            if any(bound >= error for error in negative.values()):
+                raise ValueError(
+                    f"{stream_name} {metric_name} bound is not strictly below "
+                    "every negative control error"
+                )
+            metrics[metric_name] = {
+                "floor": floor,
+                "worst_direct_variation": worst,
+                "bound": bound,
+                "negative_controls": negative,
+            }
+        streams[stream_name] = {"metrics": metrics}
     return {
-        "schema": "glm-hidden-capture-parity-gate-v1",
+        "schema": "glm-hidden-capture-parity-gate-v2",
         "calibration_runs": 3,
         "identity": _validated_identity(identity),
         "capture_keys": list(CAPTURE_KEYS),
-        "metrics": metrics,
+        "streams": streams,
+        "target_top1_required": True,
     }
 
 
@@ -123,23 +173,50 @@ def validate_capture_with_gate(
     artifact: Mapping[str, Any],
     identity: Mapping[str, Any],
 ) -> dict[str, Any]:
-    if artifact.get("schema") != "glm-hidden-capture-parity-gate-v1":
+    if artifact.get("schema") != "glm-hidden-capture-parity-gate-v2":
         raise ValueError("unsupported parity gate artifact")
     expected_identity = _validated_identity(identity)
     if artifact.get("identity") != expected_identity:
         raise ValueError("parity gate identity differs from the active runtime identity")
-    actual = capture_error_metrics(reference, candidate)
-    results = {}
+    actual = capture_stream_error_metrics(reference, candidate)
+    stream_results = {}
     passed = True
-    for name in METRIC_KEYS:
-        metric = artifact.get("metrics", {}).get(name)
-        if not isinstance(metric, Mapping) or "bound" not in metric:
-            raise ValueError(f"parity gate is missing metric {name}")
-        bound = float(metric["bound"])
-        ok = actual[name] <= bound
-        results[name] = {"value": actual[name], "bound": bound, "passed": ok}
-        passed &= ok
-    return {"passed": passed, "results": results, "identity": expected_identity}
+    artifact_streams = artifact.get("streams")
+    if not isinstance(artifact_streams, Mapping) or tuple(artifact_streams) != tuple(actual):
+        raise ValueError("parity gate stream set differs from capture")
+    for stream_name, actual_metrics in actual.items():
+        metric_results = {}
+        stream_passed = True
+        configured = artifact_streams[stream_name].get("metrics", {})
+        for metric_name in METRIC_KEYS:
+            metric = configured.get(metric_name)
+            if not isinstance(metric, Mapping) or "bound" not in metric:
+                raise ValueError(
+                    f"parity gate is missing metric {stream_name}.{metric_name}"
+                )
+            bound = float(metric["bound"])
+            ok = actual_metrics[metric_name] <= bound
+            metric_results[metric_name] = {
+                "value": actual_metrics[metric_name],
+                "bound": bound,
+                "passed": ok,
+            }
+            stream_passed &= ok
+        stream_results[stream_name] = {
+            "passed": stream_passed,
+            "metrics": metric_results,
+        }
+        passed &= stream_passed
+    reference_top1 = torch.as_tensor(reference["target_logits"]).argmax(dim=-1)
+    candidate_top1 = torch.as_tensor(candidate["target_logits"]).argmax(dim=-1)
+    top1_passed = bool(torch.equal(reference_top1, candidate_top1))
+    passed &= top1_passed
+    return {
+        "passed": passed,
+        "streams": stream_results,
+        "target_top1": {"passed": top1_passed},
+        "identity": expected_identity,
+    }
 
 
 def _load_capture(path: str | Path) -> dict[str, torch.Tensor]:

@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from glm_dflash2.hidden_cache import PackedHiddenDataset
+from glm_dflash2.target_io import load_frozen_target_io
 
 if __package__:
     from .calibrate_hidden_capture_gate import validate_capture_with_gate
@@ -50,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Active target/runtime identity; required with --parity-gate.",
     )
+    parser.add_argument(
+        "--target-io-dir",
+        type=Path,
+        help="Frozen target I/O used to verify final-hidden LM-head logits and top-1.",
+    )
     return parser
 
 
@@ -58,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if (args.parity_gate is None) != (args.runtime_identity_json is None):
         parser.error("--parity-gate and --runtime-identity-json must be used together")
+    if args.parity_gate is not None and args.target_io_dir is None:
+        parser.error("--target-io-dir is required with --parity-gate")
     dataset = PackedHiddenDataset(
         args.cache_dir,
         require_frozen=not args.allow_building_cache,
@@ -109,22 +117,35 @@ def main(argv: list[str] | None = None) -> int:
         if args.parity_gate is not None:
             if reference_final is None:
                 raise ValueError("parity gate requires reference target_final_hidden")
+            if "target_logits" not in reference:
+                raise ValueError("parity gate requires independent reference target_logits")
+            target_io = load_frozen_target_io(
+                args.target_io_dir,
+                device="cpu",
+                dtype=torch.bfloat16,
+            )
+            head_dtype = next(target_io.lm_head.parameters()).dtype
+            candidate_logits = target_io.lm_head(
+                row["target_final_hidden"].to(head_dtype)
+            )
             artifact = json.loads(args.parity_gate.read_text(encoding="utf-8"))
             identity = json.loads(args.runtime_identity_json.read_text(encoding="utf-8"))
             parity_result = validate_capture_with_gate(
                 reference={
                     "aux_hidden_states": reference_hidden,
                     "target_final_hidden": reference_final,
+                    "target_logits": torch.as_tensor(reference["target_logits"]),
                 },
                 candidate={
                     "aux_hidden_states": row["layer_hidden_states"],
                     "target_final_hidden": row["target_final_hidden"],
+                    "target_logits": candidate_logits,
                 },
                 artifact=artifact,
                 identity=identity,
             )
             if not parity_result["passed"]:
-                raise ValueError(f"hidden capture parity gate failed: {parity_result['results']}")
+                raise ValueError(f"hidden capture parity gate failed: {parity_result}")
             reference_status = "matched_parity_gate"
         else:
             for layer_index, layer_id in enumerate(dataset.spec.layer_ids):

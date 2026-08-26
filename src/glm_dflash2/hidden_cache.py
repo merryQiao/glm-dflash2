@@ -41,6 +41,14 @@ def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 CaptureMappingTuple = tuple[str, int, str, str]
 
 
@@ -206,6 +214,7 @@ def rebuild_manifest_from_index(
         "total_tokens": sum(int(row["tokens"]) for row in rows),
         "segments": sorted({str(int(row["segment"])) for row in rows}, key=int),
         "provenance": old.get("provenance", {}),
+        "seal": old.get("seal"),
     }
     if write:
         root.mkdir(parents=True, exist_ok=True)
@@ -401,6 +410,24 @@ class PackedHiddenWriter:
     def freeze(self) -> None:
         if self._index is None:
             raise RuntimeError("writer is not open")
+        self._index.flush()
+        os.fsync(self._index.fileno())
+        for handle in self._files.values():
+            handle.flush()
+            os.fsync(handle.fileno())
+        index_path = self.root / "index.jsonl"
+        files: dict[str, int] = {}
+        for segment in self._manifest["segments"]:
+            segment_dir = self.root / f"segment-{int(segment):05d}"
+            for name in self._streams:
+                path = segment_dir / f"{name}.bin"
+                files[path.relative_to(self.root).as_posix()] = path.stat().st_size
+        self._manifest["seal"] = {
+            "index_sha256": _file_sha256(index_path),
+            "index_bytes": index_path.stat().st_size,
+            "rows": int(self._manifest["samples"]),
+            "files": files,
+        }
         self._manifest["status"] = "frozen"
         _atomic_json(self.root / "manifest.json", self._manifest)
 
@@ -435,6 +462,8 @@ class PackedHiddenDataset(Dataset):
         if not raw_spec:
             raise ValueError("hidden cache manifest has no spec")
         self.spec = _spec_from_json(raw_spec)
+        if require_frozen and self.spec.schema_version == 2:
+            self._validate_seal()
         if self.spec.schema_version == 1 and not allow_legacy_v1:
             raise ValueError("legacy schema v1 requires allow_legacy_v1=True")
         self.aligned_methods_allowed = self.spec.schema_version == 2
@@ -443,6 +472,26 @@ class PackedHiddenDataset(Dataset):
         for row in self.rows:
             if set(_row_streams(row)) != set(self._streams):
                 raise ValueError("cache row stream set differs from manifest schema")
+
+    def _validate_seal(self) -> None:
+        seal = self.manifest.get("seal")
+        if not isinstance(seal, Mapping):
+            raise ValueError("frozen schema-v2 cache is missing an integrity seal")
+        index_path = self.root / "index.jsonl"
+        if (
+            int(seal.get("index_bytes", -1)) != index_path.stat().st_size
+            or str(seal.get("index_sha256", "")) != _file_sha256(index_path)
+        ):
+            raise ValueError("sealed index checksum or byte length differs")
+        if int(seal.get("rows", -1)) != int(self.manifest.get("samples", -2)):
+            raise ValueError("sealed index row count differs")
+        files = seal.get("files")
+        if not isinstance(files, Mapping):
+            raise ValueError("frozen cache seal is missing segment file sizes")
+        for relative, expected_size in files.items():
+            path = self.root / str(relative)
+            if not path.is_file() or path.stat().st_size != int(expected_size):
+                raise ValueError(f"sealed segment size differs for {relative}")
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -498,6 +547,24 @@ class PackedHiddenDataset(Dataset):
                 (tokens, int(self.spec.final_hidden_size)),
             )
         return result
+
+
+def validate_frozen_hidden_cache(root: str | Path) -> dict[str, Any]:
+    """Perform the one-time, all-row checksum scan required before training."""
+
+    dataset = PackedHiddenDataset(
+        root,
+        require_frozen=True,
+        verify_checksums=True,
+    )
+    for index in range(len(dataset)):
+        row = dataset[index]
+        for key in ("layer_hidden_states", "target_final_hidden"):
+            if not bool(torch.isfinite(row[key].float()).all()):
+                raise ValueError(
+                    f"sample {row['sample_id']} contains non-finite values in {key}"
+                )
+    return dict(dataset.manifest)
 
 
 class DFlashHiddenCollator:

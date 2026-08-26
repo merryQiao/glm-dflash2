@@ -31,12 +31,17 @@ from glm_dflash2.distributed import (
     initialize_distributed,
     rank_epoch_seed,
     reduce_additive_metrics,
+    run_rank0_preflight,
     scale_loss_for_accumulation,
     shutdown_distributed,
 )
 from glm_dflash2.draft_backbone import DFlashDraftModel
 from glm_dflash2.dspark_model import DSparkDraftModel
-from glm_dflash2.hidden_cache import DFlashHiddenCollator, PackedHiddenDataset
+from glm_dflash2.hidden_cache import (
+    DFlashHiddenCollator,
+    PackedHiddenDataset,
+    validate_frozen_hidden_cache,
+)
 from glm_dflash2.offline_trainer import (
     OfflineDFlash2Trainer,
     OfflineDFlashTrainer,
@@ -376,6 +381,13 @@ def main(argv: list[str] | None = None, *, default_method: str | None = None) ->
     barrier()
     log_handle = None
     try:
+        # Verify every row and checksum once, before allocating draft or target
+        # tensors.  Only rank 0 performs shared-storage I/O; the result is
+        # broadcast so no worker can continue with a corrupt cache.
+        run_rank0_preflight(
+            lambda: validate_frozen_hidden_cache(args.cache_dir),
+            is_main=context.is_main,
+        )
         dataset = PackedHiddenDataset(args.cache_dir, require_frozen=True)
         validate_aligned_cache_manifest(dataset.manifest, method=args.method)
         target_io = load_frozen_target_io(

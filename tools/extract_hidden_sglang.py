@@ -11,11 +11,13 @@ import multiprocessing
 import os
 import shutil
 import sys
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import torch.distributed as dist
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -31,6 +33,45 @@ from glm_dflash2.sglang_hidden_runner import (  # noqa: E402
 )
 from glm_dflash2.provenance import local_model_fingerprint  # noqa: E402
 from glm_dflash2.target_io import model_revision, tokenizer_fingerprint  # noqa: E402
+
+
+def _supervise_processes(
+    processes: list[Any], *, poll_seconds: float = 0.1
+) -> None:
+    """Fail fast when one TP worker dies instead of leaving peers in collectives."""
+
+    try:
+        while True:
+            exitcodes = [process.exitcode for process in processes]
+            failures = [code for code in exitcodes if code not in (None, 0)]
+            if failures:
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                raise RuntimeError(f"SGLang hidden rank workers failed: {failures}")
+            if all(code == 0 for code in exitcodes):
+                return
+            time.sleep(float(poll_seconds))
+    finally:
+        for process in processes:
+            process.join()
+
+
+def _raise_if_any_rank_failed(local_error: str | None, *, device: Any) -> None:
+    """Keep TP ranks on one control path after a recoverable Python failure."""
+
+    if not dist.is_initialized():
+        if local_error is not None:
+            raise RuntimeError(local_error)
+        return
+    flag = torch.tensor(int(local_error is not None), device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    if not bool(flag.item()):
+        return
+    errors: list[str | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(errors, local_error)
+    details = [f"rank {rank}: {error}" for rank, error in enumerate(errors) if error]
+    raise RuntimeError("SGLang hidden capture failed; " + "; ".join(details))
 
 
 def _sha256(path: Path) -> str:
@@ -163,7 +204,18 @@ def _worker(
                 continue
             row = control
             sample_id = str(row["id"])
-            capture = runner.extract(row["input_ids"])
+            capture = None
+            capture_error = None
+            try:
+                capture = runner.extract(row["input_ids"])
+            except BaseException as exc:
+                capture_error = f"{type(exc).__name__}: {exc}"
+            _raise_if_any_rank_failed(
+                capture_error,
+                device=runner._runner.device,
+            )
+            if capture is None:
+                raise RuntimeError("capture failed without a propagated rank error")
             write_error = None
             if tp_rank == 0:
                 try:
@@ -352,13 +404,7 @@ def main() -> int:
                     )
                     process.start()
                     workers.append(process)
-            failures = []
-            for process in workers:
-                process.join()
-                if process.exitcode:
-                    failures.append(process.exitcode)
-            if failures:
-                raise RuntimeError(f"SGLang hidden workers failed: {failures}")
+            _supervise_processes(workers)
     finally:
         if server_args.tp_size != 1:
             kill_process_tree(os.getpid(), include_parent=False)

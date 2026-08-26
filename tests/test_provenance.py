@@ -6,10 +6,74 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from glm_dflash2.provenance import dataset_fingerprint, local_model_fingerprint
+from glm_dflash2.provenance import (
+    dataset_fingerprint,
+    load_verified_endpoint_manifest,
+    local_model_fingerprint,
+)
 
 
 class ProvenanceTest(unittest.TestCase):
+    def test_external_endpoint_manifest_is_bound_to_local_model_and_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "endpoint.json"
+            value = {
+                "schema": "glm-sglang-endpoint-v1",
+                "served_model_name": "GLM-5.2",
+                "model_fingerprint": "model-sha",
+                "tokenizer_fingerprint": "tokenizer-sha",
+                "dtype": "bfloat16",
+                "runtime": {
+                    "sglang_version": "0.5.16",
+                    "cann_version": "8.3.RC1",
+                    "image_digest": "sha256:image",
+                    "tp_size": 16,
+                },
+            }
+            path.write_text(json.dumps(value), encoding="utf-8")
+            loaded = load_verified_endpoint_manifest(
+                path,
+                expected_model_fingerprint="model-sha",
+                expected_tokenizer_fingerprint="tokenizer-sha",
+                expected_served_model_name="GLM-5.2",
+            )
+            self.assertEqual(loaded["manifest"], value)
+            self.assertRegex(loaded["sha256"], r"^[0-9a-f]{64}$")
+
+            value["model_fingerprint"] = "other"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "model fingerprint"):
+                load_verified_endpoint_manifest(
+                    path,
+                    expected_model_fingerprint="model-sha",
+                    expected_tokenizer_fingerprint="tokenizer-sha",
+                    expected_served_model_name="GLM-5.2",
+                )
+
+    def test_external_endpoint_manifest_fails_closed_on_missing_runtime_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "endpoint.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": "glm-sglang-endpoint-v1",
+                        "served_model_name": "GLM-5.2",
+                        "model_fingerprint": "model-sha",
+                        "tokenizer_fingerprint": "tokenizer-sha",
+                        "dtype": "bfloat16",
+                        "runtime": {"tp_size": 16},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "runtime identity"):
+                load_verified_endpoint_manifest(
+                    path,
+                    expected_model_fingerprint="model-sha",
+                    expected_tokenizer_fingerprint="tokenizer-sha",
+                    expected_served_model_name="GLM-5.2",
+                )
+
     def test_model_fingerprint_changes_when_weight_artifact_changes(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

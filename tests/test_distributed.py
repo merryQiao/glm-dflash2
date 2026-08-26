@@ -13,6 +13,7 @@ from glm_dflash2.distributed import (
     rank_epoch_seed,
     resolve_device_backend,
     reduce_additive_metrics,
+    run_rank0_preflight,
     scale_loss_for_accumulation,
 )
 
@@ -113,6 +114,24 @@ class DistributedTest(unittest.TestCase):
         all_targets = torch.cat([value[1] for value in batches])
         (reference * all_inputs - all_targets).square().mean().backward()
         torch.testing.assert_close(accumulated.grad, reference.grad)
+
+    def test_rank0_preflight_broadcasts_failure_before_other_ranks_continue(self):
+        with self.assertRaisesRegex(RuntimeError, "cache invalid"):
+            run_rank0_preflight(
+                lambda: (_ for _ in ()).throw(ValueError("cache invalid")),
+                is_main=True,
+            )
+
+        def inject_failure(payload, src=0):
+            del src
+            payload[0] = "ValueError: cache invalid"
+
+        action = mock.Mock()
+        with mock.patch("glm_dflash2.distributed.dist.is_initialized", return_value=True), \
+             mock.patch("glm_dflash2.distributed.dist.broadcast_object_list", side_effect=inject_failure), \
+             self.assertRaisesRegex(RuntimeError, "cache invalid"):
+            run_rank0_preflight(action, is_main=False)
+        action.assert_not_called()
 
 
 if __name__ == "__main__":

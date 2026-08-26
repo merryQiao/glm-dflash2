@@ -6,6 +6,8 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -25,6 +27,9 @@ class HiddenParityGateTest(unittest.TestCase):
                 [[[1.0, 2.0], [3.0, 4.0]], [[2.0, -1.0], [0.5, 3.0]]]
             ),
             "target_final_hidden": torch.tensor([[1.0, -2.0], [4.0, 0.5]]),
+            "target_logits": torch.tensor(
+                [[0.2, 1.3, -0.4], [2.0, -1.0, 0.3]]
+            ),
         }
         self.identity = {
             "target_fingerprint": "glm52-bf16-sha",
@@ -67,16 +72,30 @@ class HiddenParityGateTest(unittest.TestCase):
             floors=floors,
             identity=self.identity,
         )
-        self.assertEqual(artifact["schema"], "glm-hidden-capture-parity-gate-v1")
+        self.assertEqual(artifact["schema"], "glm-hidden-capture-parity-gate-v2")
         self.assertEqual(artifact["calibration_runs"], 3)
         self.assertEqual(artifact["identity"], self.identity)
-        for name, values in artifact["metrics"].items():
-            self.assertEqual(
-                values["bound"],
-                max(values["floor"], 2.0 * values["worst_direct_variation"]),
-            )
-            self.assertLess(values["bound"], values["negative_controls"]["shifted_layer"])
-            self.assertLess(values["bound"], values["negative_controls"]["pre_norm"])
+        self.assertEqual(
+            tuple(artifact["streams"]),
+            (
+                "aux_hidden_states.layer_0",
+                "aux_hidden_states.layer_1",
+                "target_final_hidden",
+                "target_logits",
+            ),
+        )
+        for stream in artifact["streams"].values():
+            for values in stream["metrics"].values():
+                self.assertEqual(
+                    values["bound"],
+                    max(values["floor"], 2.0 * values["worst_direct_variation"]),
+                )
+                self.assertLess(
+                    values["bound"], values["negative_controls"]["shifted_layer"]
+                )
+                self.assertLess(
+                    values["bound"], values["negative_controls"]["pre_norm"]
+                )
 
         result = validate_capture_with_gate(
             reference=self.reference,
@@ -85,6 +104,33 @@ class HiddenParityGateTest(unittest.TestCase):
             identity=self.identity,
         )
         self.assertTrue(result["passed"])
+        self.assertTrue(result["target_top1"]["passed"])
+
+    def test_one_bad_aux_layer_fails_even_when_other_streams_match(self):
+        artifact = calibrate_parity_gate(
+            direct_runs=[self.reference, self.reference, self.reference],
+            negative_controls={
+                "shifted_layer": self._offset(0.5),
+                "pre_norm": self._offset(-0.4),
+            },
+            floors={
+                "cosine_error": 1e-9,
+                "max_abs_error": 1e-6,
+                "mean_abs_error": 1e-6,
+            },
+            identity=self.identity,
+        )
+        candidate = {key: value.clone() for key, value in self.reference.items()}
+        candidate["aux_hidden_states"][:, 1].add_(0.1)
+        result = validate_capture_with_gate(
+            reference=self.reference,
+            candidate=candidate,
+            artifact=artifact,
+            identity=self.identity,
+        )
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["streams"]["aux_hidden_states.layer_0"]["passed"])
+        self.assertFalse(result["streams"]["aux_hidden_states.layer_1"]["passed"])
 
     def test_gate_fails_closed_on_identity_mismatch_or_weak_negative_control(self):
         direct = [self.reference, self.reference, self.reference]
@@ -155,6 +201,9 @@ class HiddenParityGateTest(unittest.TestCase):
                     "input_ids": torch.tensor([1, 2]),
                     "aux_hidden_states": aux,
                     "target_final_hidden": final,
+                    "target_logits": torch.tensor(
+                        [[1.0, 2.0, -1.0], [3.0, 4.0, -2.0]]
+                    ),
                     "layer_ids": [1, 20, 38, 56, 75],
                 },
                 reference,
@@ -162,6 +211,9 @@ class HiddenParityGateTest(unittest.TestCase):
             capture = {
                 "aux_hidden_states": aux.float(),
                 "target_final_hidden": final.float(),
+                "target_logits": torch.tensor(
+                    [[1.0, 2.0, -1.0], [3.0, 4.0, -2.0]]
+                ),
             }
             artifact = calibrate_parity_gate(
                 direct_runs=[capture, capture, capture],
@@ -183,13 +235,22 @@ class HiddenParityGateTest(unittest.TestCase):
             artifact_path.write_text(json.dumps(artifact))
             identity_path.write_text(json.dumps(self.identity))
             output = StringIO()
-            with redirect_stdout(output):
+            head = torch.nn.Linear(2, 3, bias=False)
+            with torch.no_grad():
+                head.weight.copy_(
+                    torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.0, -0.5]])
+                )
+            with mock.patch(
+                "tools.validate_hidden_cache.load_frozen_target_io",
+                return_value=SimpleNamespace(lm_head=head),
+            ), redirect_stdout(output):
                 status = validate_cache(
                     [
                         "--cache-dir", str(cache),
                         "--reference-pt", str(reference),
                         "--parity-gate", str(artifact_path),
                         "--runtime-identity-json", str(identity_path),
+                        "--target-io-dir", str(root / "target-io"),
                     ]
                 )
             self.assertEqual(status, 0)

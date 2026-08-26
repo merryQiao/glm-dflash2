@@ -48,7 +48,12 @@ from glm_dflash2.vibe_coding import (  # noqa: E402
     load_vibe_coding_table,
     row_to_model_input,
 )
-from glm_dflash2.provenance import dataset_fingerprint, local_model_fingerprint  # noqa: E402
+from glm_dflash2.provenance import (  # noqa: E402
+    dataset_fingerprint,
+    load_verified_endpoint_manifest,
+    local_model_fingerprint,
+)
+from glm_dflash2.target_io import model_revision, tokenizer_fingerprint  # noqa: E402
 from glm_dflash2.open_swe_trajectories import OpenSWETrajectoryStore  # noqa: E402
 from glm_dflash2.workspaces import (  # noqa: E402
     ORIGINAL_TRAJECTORY_KINDS,
@@ -79,6 +84,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--served-model-name", default="GLM-5.2")
     parser.add_argument("--output-jsonl", type=Path, required=True)
     parser.add_argument("--endpoint")
+    parser.add_argument(
+        "--endpoint-manifest",
+        type=Path,
+        help="Immutable model/runtime identity for an external SGLang endpoint.",
+    )
+    parser.add_argument(
+        "--allow-unverified-endpoint",
+        action="store_true",
+        help="Smoke-only escape hatch; production external endpoints require a manifest.",
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
@@ -576,6 +591,30 @@ def main() -> int:
     ]
     data_fingerprint = dataset_fingerprint(args.dataset)
     model_fingerprint = local_model_fingerprint(args.model_path)
+    tokenizer_identity = tokenizer_fingerprint(args.model_path)
+    target_config = json.loads(
+        (args.model_path / "config.json").read_text(encoding="utf-8")
+    )
+    target_revision = model_revision(target_config, model_fingerprint)
+    target_vocab_size = int(target_config["vocab_size"])
+    if args.endpoint_manifest is not None and args.endpoint is None:
+        raise ValueError("--endpoint-manifest is only valid with --endpoint")
+    if args.allow_unverified_endpoint and args.endpoint is None:
+        raise ValueError("--allow-unverified-endpoint is only valid with --endpoint")
+    endpoint_identity = None
+    if args.endpoint is not None:
+        if args.endpoint_manifest is None and not args.allow_unverified_endpoint:
+            raise ValueError(
+                "external --endpoint requires --endpoint-manifest; use "
+                "--allow-unverified-endpoint only for a small smoke run"
+            )
+        if args.endpoint_manifest is not None:
+            endpoint_identity = load_verified_endpoint_manifest(
+                args.endpoint_manifest,
+                expected_model_fingerprint=model_fingerprint,
+                expected_tokenizer_fingerprint=tokenizer_identity,
+                expected_served_model_name=args.served_model_name,
+            )
     workspaces = _workspace_map(args.workspace_map)
     workspace_provider = AutomaticWorkspaceProvider(
         args.workspace_cache,
@@ -603,11 +642,14 @@ def main() -> int:
     done = set() if args.no_resume else _existing_ids(args.output_jsonl)
     truncate = args.no_resume
     run_contract = {
-        "schema_version": 1,
+        "schema_version": 2,
         "stage": "trajectory",
         "status": "running",
         "model_path": str(args.model_path.resolve()),
         "model_fingerprint": model_fingerprint,
+        "model_revision": target_revision,
+        "tokenizer_fingerprint": tokenizer_identity,
+        "vocab_size": target_vocab_size,
         "served_model_name": args.served_model_name,
         "service": {
             "mode": "external_endpoint" if args.endpoint else "local_sglang",
@@ -620,8 +662,8 @@ def main() -> int:
             "max_running_requests": args.max_running_requests,
             "max_total_tokens": args.max_total_tokens,
             "server_extra_args": list(args.server_extra_arg),
-            # The OpenAI protocol exposes a served name, not a weight digest.
-            "weight_identity_verified": args.endpoint is None,
+            "weight_identity_verified": args.endpoint is None or endpoint_identity is not None,
+            "endpoint_identity": endpoint_identity,
         },
         "dataset": str(args.dataset.resolve()),
         "dataset_fingerprint": data_fingerprint.digest,
@@ -677,7 +719,9 @@ def main() -> int:
         for key, value in run_contract.items():
             if key == "status":
                 continue
-            if key in previous and previous[key] != value:
+            if key not in previous:
+                raise ValueError(f"resume contract is missing required key {key}")
+            if previous[key] != value:
                 raise ValueError(
                     f"resume contract mismatch for {key}: {previous[key]!r} != {value!r}"
                 )

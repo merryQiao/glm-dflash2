@@ -14,6 +14,7 @@ from glm_dflash2.hidden_cache import (
     PackedHiddenDataset,
     PackedHiddenWriter,
     rebuild_manifest_from_index,
+    validate_frozen_hidden_cache,
 )
 
 
@@ -188,6 +189,35 @@ class HiddenCacheTest(unittest.TestCase):
             dataset = PackedHiddenDataset(root, verify_checksums=True)
             with self.assertRaisesRegex(ValueError, "checksum"):
                 _ = dataset[0]
+
+    def test_freeze_seals_index_and_segment_sizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with PackedHiddenWriter(root, spec=self._spec()) as writer:
+                self._append(writer)
+                writer.freeze()
+            manifest = json.loads((root / "manifest.json").read_text())
+            self.assertRegex(manifest["seal"]["index_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(manifest["seal"]["rows"], 1)
+            self.assertIn("segment-00000/input_ids.bin", manifest["seal"]["files"])
+            with (root / "index.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write("\n")
+            with self.assertRaisesRegex(ValueError, "sealed index"):
+                PackedHiddenDataset(root)
+
+    def test_full_cache_validation_reads_every_committed_checksum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with PackedHiddenWriter(root, spec=self._spec()) as writer:
+                self._append(writer, "first")
+                self._append(writer, "second")
+                writer.freeze()
+            path = root / "segment-00000" / "loss_mask.bin"
+            raw = bytearray(path.read_bytes())
+            raw[0] ^= 1
+            path.write_bytes(raw)
+            with self.assertRaisesRegex(ValueError, "checksum.*first"):
+                validate_frozen_hidden_cache(root)
 
     def test_opening_frozen_dataset_is_read_only_and_checksum_is_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:

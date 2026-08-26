@@ -4,7 +4,7 @@ import importlib
 import os
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Mapping
+from typing import Callable, Mapping
 
 import torch
 import torch.distributed as dist
@@ -194,6 +194,23 @@ def distributed_any(value: bool, device: torch.device) -> bool:
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
     return bool(flag.item())
+
+
+def run_rank0_preflight(action: Callable[[], object], *, is_main: bool) -> None:
+    """Run an expensive validation once and fail every rank with one result."""
+
+    error = None
+    if is_main:
+        try:
+            action()
+        except BaseException as exc:
+            error = f"{type(exc).__name__}: {exc}"
+    if dist.is_initialized():
+        payload = [error]
+        dist.broadcast_object_list(payload, src=0)
+        error = payload[0]
+    if error is not None:
+        raise RuntimeError(f"rank-0 preflight failed: {error}")
 
 
 def barrier() -> None:

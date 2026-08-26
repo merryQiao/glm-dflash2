@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 MODEL_CONFIG_PATTERNS = (
@@ -15,6 +17,13 @@ MODEL_CONFIG_PATTERNS = (
     "*.index.json",
 )
 MODEL_WEIGHT_PATTERNS = ("*.safetensors", "*.bin", "*.pt")
+ENDPOINT_MANIFEST_SCHEMA = "glm-sglang-endpoint-v1"
+ENDPOINT_RUNTIME_KEYS = (
+    "sglang_version",
+    "cann_version",
+    "image_digest",
+    "tp_size",
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +33,52 @@ class DatasetFingerprint:
     revision: str | None
     parquet_files: int
     bytes: int
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_verified_endpoint_manifest(
+    path: str | Path,
+    *,
+    expected_model_fingerprint: str,
+    expected_tokenizer_fingerprint: str,
+    expected_served_model_name: str,
+) -> dict[str, Any]:
+    """Validate the immutable identity advertised by an external SGLang server."""
+
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"external endpoint manifest does not exist: {manifest_path}")
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema") != ENDPOINT_MANIFEST_SCHEMA:
+        raise ValueError(f"endpoint manifest schema must be {ENDPOINT_MANIFEST_SCHEMA}")
+    if value.get("model_fingerprint") != expected_model_fingerprint:
+        raise ValueError("external endpoint model fingerprint differs from local MODEL_PATH")
+    if value.get("tokenizer_fingerprint") != expected_tokenizer_fingerprint:
+        raise ValueError("external endpoint tokenizer fingerprint differs from local MODEL_PATH")
+    if value.get("served_model_name") != expected_served_model_name:
+        raise ValueError("external endpoint served model name differs from the request model")
+    if value.get("dtype") != "bfloat16":
+        raise ValueError("external endpoint must advertise dtype=bfloat16")
+    runtime = value.get("runtime")
+    if not isinstance(runtime, dict):
+        raise ValueError("external endpoint manifest is missing runtime identity")
+    missing = [key for key in ENDPOINT_RUNTIME_KEYS if runtime.get(key) in (None, "")]
+    if missing or not isinstance(runtime.get("tp_size"), int) or runtime["tp_size"] < 1:
+        raise ValueError(
+            "external endpoint manifest is missing runtime identity: "
+            + ", ".join(missing or ["tp_size"])
+        )
+    canonical = _canonical_json_bytes(value)
+    return {
+        "manifest": value,
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+        "path": str(manifest_path.resolve()),
+    }
 
 
 def _update_file_content(digest: "hashlib._Hash", path: Path, *, chunk_size: int = 1024 * 1024) -> None:
