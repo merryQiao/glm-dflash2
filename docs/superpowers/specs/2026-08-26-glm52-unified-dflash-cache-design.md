@@ -14,7 +14,9 @@ The common draft backbone follows the published GLM-5.2 DFlash checkpoint
 rather than the Qwen3.8 DFlash2 checkpoint:
 
 - target decoder depth: 78;
-- target auxiliary layers: `[1, 20, 38, 56, 75]` in this exact order;
+- target auxiliary layers: `[1, 20, 38, 56, 75]` in this exact order. These
+  are zero-based decoder-block IDs in `0..77`; layer `k` means the residual
+  stream immediately after decoder block `k`;
 - target hidden size: 6144;
 - draft layers: 5;
 - draft hidden size: 6144;
@@ -27,6 +29,11 @@ rather than the Qwen3.8 DFlash2 checkpoint:
 - RoPE theta: 8,000,000;
 - RMS norm epsilon: `1e-5`;
 - block size: 16, represented by one known anchor and 15 predicted tokens.
+
+The attention projections do not derive `head_dim` from `hidden_size / heads`.
+Q, K, and V each have width `64 * 64 = 4096`, and the output projection maps
+`4096 -> 6144`. Tests enforce these nonstandard but published GLM DFlash
+shapes.
 
 DFlash2 adds only its two-tap grouped dynamic convolution and rank-256/top-16
 path selector to this common backbone. DSpark adds only its Markov and
@@ -63,7 +70,11 @@ target_final_hidden:  bfloat16[T, 6144]
 ```
 
 `aux_hidden_states[:, i]` is the output of logical target decoder layer
-`[1, 20, 38, 56, 75][i]` at the same token position as `input_ids`.
+`[1, 20, 38, 56, 75][i]` at the same token position as `input_ids`. In a
+Transformers hidden-state tuple whose element 0 is the embedding output, these
+map to tuple indices `[2, 21, 39, 57, 76]`. Each backend stores a mapping record
+containing its namespace, requested logical ID, concrete tap, and tap semantics;
+a bare list of undocumented physical IDs is insufficient.
 
 `target_final_hidden` has a stricter semantic contract: it is the
 **post-final-norm tensor directly consumed by the frozen target LM head**. It is
@@ -90,7 +101,7 @@ Schema v2 records:
 
 - schema version;
 - exact ordered logical auxiliary layer IDs;
-- physical capture IDs used by the runtime;
+- backend-specific capture mapping and tap semantics;
 - target decoder depth;
 - auxiliary and final hidden sizes and dtypes;
 - `final_hidden_semantics = "post_final_norm_lm_head_input"`;
@@ -101,16 +112,22 @@ Schema v2 records:
 Readers fail closed on missing streams, wrong dimensions, wrong layer order,
 wrong final-hidden semantics, truncated files, or checksum mismatches.
 
-Schema v1 remains readable for DFlash and DFlash2. DSpark must reject schema v1
-because it cannot reconstruct the target distribution without final hidden
-states. There is no fake migration from v1 to v2; existing trajectories may be
-reused, but Stage B must be rerun to produce the missing final-hidden stream.
+Every schema-v2 stream is mandatory and validated, even when a particular
+consumer ignores `target_final_hidden`. Schema v1 remains readable only through
+an explicit legacy adapter for exploratory DFlash and DFlash2 runs. The aligned
+three-method comparison pins one v2 manifest and identical sample IDs/checksums
+for all consumers; it never mixes v1 and v2 data. There is no fake migration
+from v1 to v2: reusing trajectories means rerunning Stage B for the same Stage-A
+records. `aux_hidden_states` is persisted; the `hidden_states` flattened view is
+derived by the reader and is not a fifth independent stream.
 
 ## Hidden extraction semantics
 
 The SGLang bridge requests the five auxiliary decoder outputs and the final
 post-norm output in one pass. Rank 0 writes both results after converting them
 to CPU BF16; nonzero tensor-parallel ranks return empty host tensors as before.
+The one-forward rule applies to production Stage B. A separate direct reference
+forward is allowed only in the numerical validation gate.
 
 Shape checks alone are insufficient. Before a full run, a real GLM-5.2 BF16
 hardware gate compares several short sequences against a direct model hook:
@@ -120,55 +137,104 @@ hardware gate compares several short sequences against a direct model hook:
 - logits reconstructed from cached final hidden versus the target forward
   logits.
 
-The comparison reports cosine similarity, maximum absolute error, and mean
-absolute error and must fail on wrong layer ordering or pre-norm capture.
+The comparison uses fixed token fixtures and reports cosine similarity, maximum
+absolute error, and mean absolute error. Tolerances are established by comparing
+two direct BF16 runs on the deployment stack, then frozen in the gate. Negative
+controls deliberately substitute a pre-norm tensor and shift one layer ID; both
+must fail.
 
 ## Method consumers
 
 ### DFlash
 
 Consumes `input_ids`, `loss_mask`, and the five auxiliary hidden layers. It uses
-the common backbone and hard-token block CE. It does not read final hidden.
+the common backbone and hard-token block CE. For predicted depths `d=0..14`,
+`y_d = input_ids[a+d+1]`, and
+
+```text
+w_d = valid_d * exp(-d / 7)
+L_CE = sum_d w_d * -log q_d(y_d) / sum_d w_d
+```
+
+The global distributed numerator and denominator are reduced before division.
+It does not read final hidden.
 
 ### DFlash2
 
 Consumes the same streams as DFlash and uses the same common backbone. It adds
 the two-tap dynamic convolution and path selector. Its base CE and selector CE
-do not require final hidden.
+do not require final hidden. Base CE is identical to DFlash. At depth 0 the
+selector predecessor is the clean anchor; at later depths it is the
+teacher-forced previous target token. Selector CE is applied only when the
+current target is present in the base top-16 candidate set, using the same
+position weight and a separately reduced numerator/denominator. Its weight is
+1.0.
 
 ### DSpark
 
 Consumes the same auxiliary hidden layers and additionally reads
-`target_final_hidden`. The frozen GLM-5.2 LM head reconstructs target logits in
-chunks to bound peak memory. The method adds its Markov head and confidence
-head and uses the configured CE, distribution-distance, and confidence losses.
-The reference starting point is `0.1 * CE + 0.9 * TV/L1` with confidence-head
-weight 1.0; these coefficients remain explicit experiment configuration rather
-than hidden cache metadata.
+`target_final_hidden`. For target token `y_d = input_ids[a+d+1]`, its aligned AR
+teacher state is `target_final_hidden[a+d]`: the one-position shift is mandatory.
+The frozen GLM-5.2 LM head reconstructs target logits in exact vocabulary chunks
+to bound peak memory. The LM-head matmul uses the checkpoint BF16 dtype; draft
+and target logits are cast to FP32 for full-vocabulary softmax. Target
+probabilities are detached.
+
+Let `q_d` and `p_d` be the draft and target FP32 softmax distributions. DSpark
+uses the DeepSpec reference definitions:
+
+```text
+L_L1 = sum_d w_d * sum_v |q_d(v) - p_d(v)| / sum_d w_d
+accept_target_d = clamp(1 - 0.5 * sum_v |q_d(v) - p_d(v)|, 0, 1)
+L_conf = sum_d w_d * BCEWithLogits(c_d, stopgrad(accept_target_d)) / sum_d w_d
+L = 0.1 * L_CE + 0.9 * L_L1 + 1.0 * L_conf
+```
+
+The Markov head applies its low-rank logit bias before `q_d` is computed. Its
+predecessor IDs follow the same teacher-forced convention as the DFlash2
+selector. All numerators and denominators are reduced globally. The coefficients
+remain explicit experiment configuration rather than hidden-cache metadata.
 
 ## Block and mask contract
 
-For block size 16:
+For block size 16 and anchor token index `a`:
 
 ```text
-target: [anchor, token_1, ..., token_15]
-noise:  [anchor, MASK,    ..., MASK]
-loss:   [ignore, predict,  ..., predict]
+target: [input_ids[a], input_ids[a+1], ..., input_ids[a+15]]
+noise:  [input_ids[a], MASK,           ..., MASK]
+loss:   [ignore,       predict a+1,     ..., predict a+15]
 ```
 
-The context may attend only to positions strictly before the anchor. Draft
-positions use full non-causal attention within the block. Partial assistant
-spans near the end of a sequence remain valid when at least one successor is
-supervised; the per-position prediction mask excludes invalid suffix tokens.
-All three methods use the same sampled anchors and validity masks.
+An anchor is eligible iff `loss_mask[a] == 1`, `loss_mask[a+1] == 1`, and the
+two indices exist. This includes the first token of an assistant turn when it
+has a supervised successor, but excludes the prompt/tool token immediately
+before that turn. For depth `d`, prediction validity is the cumulative product
+of `loss_mask[a+1:a+d+2]` and the in-range mask. Consequently validity stops
+permanently at the first turn boundary, hole, or sequence end; later tokens in
+the same nominal block cannot become valid again.
+
+Every draft query may attend to auxiliary context rows with absolute positions
+`< a`, never row `a` or successor rows. The known anchor is supplied only by its
+token embedding in local draft slot 0. Every draft query may attend to all 16
+local draft slots, whose contents are one anchor plus 15 masks. Raw future token
+embeddings and auxiliary rows at positions `>= a` are forbidden.
+
+All methods obtain identical anchors from a method-independent pure sampler
+keyed only by `(global_seed, epoch, sample_id)`. It samples a uniform subset of
+eligible indices without replacement. Model RNG use, data-parallel rank, and
+method-specific forward calls cannot alter the selected anchors.
 
 ## Target I/O artifact
 
 The small frozen target artifact continues to store GLM-5.2
 `embed_tokens.weight` and `lm_head.weight`. Because the cached final hidden is
 post-final-norm, no final-norm parameters are required by offline training.
-The artifact manifest must match the hidden-cache target fingerprint and hidden
-size before training starts.
+The GLM path requires an LM head of shape `[vocab_size, 6144]` with no bias,
+logit scaling, or soft-capping. If the inspected target violates any assumption,
+the corresponding operation must be stored and reproduced rather than silently
+ignored. The artifact manifest must match the cache's model and tokenizer
+fingerprints, vocabulary size/order, hidden size, dtype, and weight checksum
+before training starts.
 
 ## Export and runtime boundary
 
@@ -193,10 +259,15 @@ Implementation follows test-driven development:
    cache that lacks it;
 5. numerical tests prove cached final hidden reconstructs the same logits as a
    direct frozen LM-head application;
-6. the existing complete CPU/distributed suite remains green under the pinned
+6. hand-computed fixtures cover the one-token teacher shift, first assistant
+   token, turn boundaries, holes, partial blocks, deterministic identical
+   anchors, selector predecessors, Markov predecessors, and every loss term;
+7. projection tests enforce Q/K/V width 4096, output width 6144, and explicit
+   `head_dim=64` rather than deriving it from hidden size;
+8. the existing complete CPU/distributed suite remains green under the pinned
    Transformers environment;
-7. real 910B numerical and serving parity gates run before full data generation
-   or training.
+9. real 910B numerical and serving parity gates run before full data generation
+   or training, including DFlash2 selector and DSpark Markov/confidence outputs.
 
 ## Non-goals
 
