@@ -138,8 +138,14 @@ hardware gate compares several short sequences against a direct model hook:
   logits.
 
 The comparison uses fixed token fixtures and reports cosine similarity, maximum
-absolute error, and mean absolute error. Tolerances are established by comparing
-two direct BF16 runs on the deployment stack, then frozen in the gate. Negative
+absolute error, and mean absolute error. A deterministic calibration runs each
+fixture three times through the direct reference and capture paths. For each
+metric, the checked-in pass threshold is the larger of an explicit numerical
+floor and twice the worst observed direct-versus-direct variation, and must
+remain strictly below the error produced by both negative controls. The floors,
+measured variations, final thresholds, model/runtime fingerprints, CANN,
+torch-npu, and SGLang versions are stored in a versioned gate artifact. A run
+without the matching artifact fails rather than recalibrating silently. Negative
 controls deliberately substitute a pre-norm tensor and shift one layer ID; both
 must fail.
 
@@ -168,7 +174,9 @@ selector predecessor is the clean anchor; at later depths it is the
 teacher-forced previous target token. Selector CE is applied only when the
 current target is present in the base top-16 candidate set, using the same
 position weight and a separately reduced numerator/denominator. Its weight is
-1.0.
+1.0. If the globally reduced selector denominator is zero, `L_selector` is a
+differentiable zero and the term is skipped. The total objective is
+`L = L_CE + 1.0 * L_selector`.
 
 ### DSpark
 
@@ -219,6 +227,11 @@ token embedding in local draft slot 0. Every draft query may attend to all 16
 local draft slots, whose contents are one anchor plus 15 masks. Raw future token
 embeddings and auxiliary rows at positions `>= a` are forbidden.
 
+RoPE always uses absolute sequence positions. Auxiliary row `t` uses position
+ID `t`; local draft slot `j=0..15` uses position ID `a+j`. Block-relative RoPE is
+forbidden. Training, exported configuration, and serving use this identical
+convention.
+
 All methods obtain identical anchors from a method-independent pure sampler
 keyed only by `(global_seed, epoch, sample_id)`. It samples a uniform subset of
 eligible indices without replacement. Model RNG use, data-parallel rank, and
@@ -264,9 +277,11 @@ Implementation follows test-driven development:
    anchors, selector predecessors, Markov predecessors, and every loss term;
 7. projection tests enforce Q/K/V width 4096, output width 6144, and explicit
    `head_dim=64` rather than deriving it from hidden size;
-8. the existing complete CPU/distributed suite remains green under the pinned
+8. selector tests cover a globally empty top-16 eligibility set and require a
+   finite differentiable zero selector term;
+9. the existing complete CPU/distributed suite remains green under the pinned
    Transformers environment;
-9. real 910B numerical and serving parity gates run before full data generation
+10. real 910B numerical and serving parity gates run before full data generation
    or training, including DFlash2 selector and DSpark Markov/confidence outputs.
 
 ## Non-goals
