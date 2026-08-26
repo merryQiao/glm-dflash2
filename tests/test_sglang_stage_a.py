@@ -38,6 +38,9 @@ class SGLangStageATest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--attention-backend") + 1], "ascend"
         )
+        self.assertEqual(
+            command[command.index("--max-total-tokens") + 1], "131072"
+        )
         self.assertIn("--trust-remote-code", command)
 
     def test_glm52_server_command_exposes_optional_ascend_moe_settings(self):

@@ -142,6 +142,29 @@ OUTPUT_JSONL=/shared/out/trajectories-shard-0-of-1.jsonl \
 bash scripts/run_stage_a_trajectories.sh
 ```
 
+Stage A defaults to `WORKERS=8` trajectory workers but permits only
+`MAX_RUNNING_REQUESTS=2` concurrent model HTTP calls. Tool execution, Git,
+containers, and workspace preparation remain concurrent while the shared
+request semaphore bounds target KV/cache pressure even for an external
+endpoint. A local SGLang server additionally receives
+`--max-running-requests 2 --max-total-tokens 131072`. The latter two settings
+must also be configured on an independently launched external SGLang service;
+the client semaphore limits requests from this driver but cannot constrain
+other clients of that service.
+
+Start conservatively on a new Ascend deployment:
+
+```bash
+WORKERS=4 MAX_RUNNING_REQUESTS=1 MAX_TOTAL_TOKENS=131072 \
+MAX_SAMPLES=50 ... bash scripts/run_stage_a_trajectories.sh
+```
+
+Then use the default `8/2` profile only after checking peak HBM. Do not copy
+the Qwen3.8 reference's `12/8` profile to GLM-5.2 BF16 without a representative
+long-context load test. `EPISODE_RETRIES=2` retries an isolated workspace
+episode; only the main thread commits JSONL records and the error ledger, so a
+retry cannot produce duplicate committed IDs.
+
 `MODEL_PATH` is still required locally for the exact tokenizer/chat template.
 An external OpenAI endpoint exposes its served model name but not a weight
 digest, so the manifest records `weight_identity_verified=false`. Operational

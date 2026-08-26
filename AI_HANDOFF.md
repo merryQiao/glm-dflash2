@@ -152,6 +152,18 @@ OUTPUT_JSONL=/shared/out/trajectories-shard-0-of-1.jsonl \
 bash scripts/run_stage_a_trajectories.sh
 ```
 
+并发分为两层，不能混为一谈：
+
+- `WORKERS=8`：同时推进 trajectory、工具调用和 workspace 操作；
+- `MAX_RUNNING_REQUESTS=2`：通过进程内共享 semaphore 限制本脚本同时发出的模型
+  HTTP 请求；本地 SGLang 也收到同名限制；
+- `MAX_TOTAL_TOKENS=131072`：本地 SGLang 的聚合 token-pool 上限。
+
+第一次在新的 910B 环境上运行时先使用
+`WORKERS=4 MAX_RUNNING_REQUESTS=1 MAX_SAMPLES=50`，确认长上下文峰值 HBM 后再切到
+默认的 `8/2`。若 `ENDPOINT` 指向外部服务，本脚本无法修改外部服务自身的 token
+pool，也无法限制其他客户端；外部 SGLang 启动参数必须单独对齐。
+
 不要将 `TEMPERATURE=0` 作为默认值。若真实线上 GLM sampling policy 不是
 `1.0/0.95/-1`，应显式传入线上参数，并重新生成完整 shard。
 
