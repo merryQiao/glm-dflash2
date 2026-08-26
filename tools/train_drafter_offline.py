@@ -13,7 +13,6 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
-from safetensors.torch import save_file
 from torch.utils.data import DataLoader, DistributedSampler
 
 from glm_dflash2.checkpointing import (
@@ -47,6 +46,7 @@ from glm_dflash2.offline_trainer import (
     OfflineDFlashTrainer,
     OfflineDSparkTrainer,
 )
+from glm_dflash2.speculator_export import export_speculator
 from glm_dflash2.target_io import load_frozen_target_io
 
 
@@ -330,7 +330,7 @@ def _ratios(method: str, reduced: dict[str, torch.Tensor]) -> dict[str, float]:
     }
 
 
-def _export(model, config, output_dir: Path, is_main: bool, target_io_manifest) -> None:
+def _export(model, config, method: str, output_dir: Path, is_main: bool, target_io) -> None:
     barrier()
     state = None
     if hasattr(model, "set_requires_gradient_sync"):
@@ -343,25 +343,13 @@ def _export(model, config, output_dir: Path, is_main: bool, target_io_manifest) 
         state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
     if is_main:
         export = output_dir / "export"
-        export.mkdir(parents=True, exist_ok=True)
-        save_file(
-            {key: value.contiguous() for key, value in state.items()},
-            export / "model.safetensors",
-        )
-        config.to_json_file(export / "config.json")
-        provenance = {
-            key: target_io_manifest.get(key)
-            for key in (
-                "schema", "source_model_fingerprint", "model_revision",
-                "tokenizer_fingerprint", "vocab_size", "hidden_size", "tensors",
-            )
-        }
-        (export / "frozen_target_io_provenance.json").write_text(
-            json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
-        )
-        (export / "EXPORT_NOTE.txt").write_text(
-            "Draft-only artifact; target backbone and frozen token I/O weights are not included.\n",
-            encoding="utf-8",
+        export_speculator(
+            export,
+            method=method,
+            config=config,
+            model=model,
+            target_io=target_io,
+            state_dict=state,
         )
     barrier()
 
@@ -575,7 +563,7 @@ def main(argv: list[str] | None = None, *, default_method: str | None = None) ->
                 semantic_config=semantic_config,
             )
         trainer.assert_frozen_io_unchanged()
-        _export(draft, config, output_dir, context.is_main, target_io.manifest)
+        _export(draft, config, args.method, output_dir, context.is_main, target_io)
         return 0
     finally:
         if log_handle is not None:
