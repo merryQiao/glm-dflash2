@@ -27,9 +27,11 @@ if [[ "$METHOD" == "dspark" && "$BLOCK_SIZE" != "8" ]]; then
   echo "DSpark requires BLOCK_SIZE=8 (one anchor + seven proposals)" >&2
   exit 2
 fi
-dspark_lr=3e-4
-dspark_epochs=1
+dspark_lr=6e-4
+dspark_epochs=3
 dspark_gamma=4
+b8_gamma=4
+b16_gamma=7
 if [[ "$METHOD" == "dspark" ]]; then
   default_lr=$dspark_lr
   default_epochs=$dspark_epochs
@@ -37,7 +39,11 @@ if [[ "$METHOD" == "dspark" ]]; then
 else
   default_lr=6e-4
   default_epochs=3
-  default_gamma=7
+  if [[ "$BLOCK_SIZE" == "8" ]]; then
+    default_gamma=$b8_gamma
+  else
+    default_gamma=$b16_gamma
+  fi
 fi
 if (( NNODES > 1 )) && [[ "$MASTER_ADDR" == "127.0.0.1" ]]; then
   echo "MASTER_ADDR must identify rank-0 host when NNODES>1" >&2

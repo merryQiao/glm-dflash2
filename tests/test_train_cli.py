@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from tools.train_dflash2_offline import build_parser
+from tools.train_drafter_offline import resolve_method_recipe
 
 
 class TrainCliTest(unittest.TestCase):
@@ -10,14 +11,14 @@ class TrainCliTest(unittest.TestCase):
         parser = build_parser()
         destinations = {action.dest for action in parser._actions}
         self.assertNotIn("target_model", destinations)
-        args = parser.parse_args(
+        args = resolve_method_recipe(parser.parse_args(
             [
                 "--cache-dir", "/cache",
                 "--target-io-dir", "/io",
                 "--output-dir", "/out",
                 "--mask-token-id", "9",
             ]
-        )
+        ))
         self.assertEqual(args.block_size, 16)
         self.assertEqual(args.num_anchors, 64)
         self.assertEqual(args.gamma, 7.0)

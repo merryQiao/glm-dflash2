@@ -27,9 +27,11 @@ class TrainingLaunchersTest(unittest.TestCase):
             "--num-draft-layers 5",
             "train_drafter_offline.py",
             'DSpark requires BLOCK_SIZE=8',
-            'dspark_lr=3e-4',
-            'dspark_epochs=1',
+            'dspark_lr=6e-4',
+            'dspark_epochs=3',
             'dspark_gamma=4',
+            'b8_gamma=4',
+            'b16_gamma=7',
         ):
             self.assertIn(value, text)
         self.assertNotIn("TARGET_MODEL", text)

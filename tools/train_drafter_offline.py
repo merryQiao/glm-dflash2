@@ -62,10 +62,9 @@ def build_parser(*, default_method: str | None = None) -> argparse.ArgumentParse
     parser.add_argument("--mask-token-id", type=int, required=True)
     parser.add_argument("--pad-token-id", type=int, default=0)
     parser.add_argument("--device", choices=("npu", "cuda", "cpu"), default="npu")
-    default_epochs = 1 if default_method == "dspark" else 3 if default_method else None
-    default_lr = 3e-4 if default_method == "dspark" else 6e-4 if default_method else None
+    default_epochs = 3 if default_method else None
+    default_lr = 6e-4 if default_method else None
     default_block = 8 if default_method == "dspark" else 16 if default_method else None
-    default_gamma = 4.0 if default_method == "dspark" else 7.0 if default_method else None
     parser.add_argument("--epochs", type=int, default=default_epochs)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8)
@@ -86,7 +85,7 @@ def build_parser(*, default_method: str | None = None) -> argparse.ArgumentParse
     # Aligned experiment constants are choices rather than mutable architecture knobs.
     parser.add_argument("--block-size", type=int, choices=(8, 16), default=default_block)
     parser.add_argument("--num-anchors", type=int, choices=(64,), default=64)
-    parser.add_argument("--gamma", type=float, choices=(4.0, 7.0), default=default_gamma)
+    parser.add_argument("--gamma", type=float, choices=(4.0, 7.0), default=None)
     parser.add_argument("--selector-rank", type=int, choices=(256,), default=256)
     parser.add_argument("--selector-top-k", type=int, choices=(16,), default=16)
     parser.add_argument("--markov-rank", type=int, choices=(256,), default=256)
@@ -100,10 +99,16 @@ def build_parser(*, default_method: str | None = None) -> argparse.ArgumentParse
 def resolve_method_recipe(args: argparse.Namespace) -> argparse.Namespace:
     """Fill and validate method-specific experiment defaults."""
 
-    if args.method == "dspark":
-        defaults = {"block_size": 8, "epochs": 1, "lr": 3e-4, "gamma": 4.0}
-    else:
-        defaults = {"block_size": 16, "epochs": 3, "lr": 6e-4, "gamma": 7.0}
+    default_block_size = 8 if args.method == "dspark" else 16
+    selected_block_size = (
+        args.block_size if args.block_size is not None else default_block_size
+    )
+    defaults = {
+        "block_size": default_block_size,
+        "epochs": 3,
+        "lr": 6e-4,
+        "gamma": 4.0 if selected_block_size == 8 else 7.0,
+    }
     for name, value in defaults.items():
         if getattr(args, name) is None:
             setattr(args, name, value)

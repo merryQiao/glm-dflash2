@@ -207,7 +207,7 @@ The Markov head is the official vanilla rank-256
 receives the concatenation of draft hidden and the same Markov predecessor
 embedding. Predecessor IDs follow the same teacher-forced convention as the
 DFlash2 selector. All numerators and denominators are reduced globally.
-DSpark defaults to one epoch, learning rate `3e-4`, gamma 4, and physical B8.
+DSpark defaults to three epochs, learning rate `6e-4`, gamma 4, and physical B8.
 
 ## Block and mask contract
 

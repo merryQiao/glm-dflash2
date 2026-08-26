@@ -43,7 +43,7 @@
 
 - [ ] Add failing parser/validation tests: DFlash and DFlash2 accept physical B8/B16; DSpark accepts only physical B8.
 - [ ] Make `build_glm52_dflash2_config` consume the selected physical block length.
-- [ ] Set DSpark launcher defaults to one epoch, `lr=3e-4`, gamma 4; retain existing DFlash/DFlash2 defaults unless explicitly overridden.
+- [ ] Set DSpark launcher defaults to three epochs, `lr=6e-4`, gamma 4; retain existing DFlash/DFlash2 defaults unless explicitly overridden.
 - [ ] Record physical block length and seven DSpark proposal positions in semantic run metadata.
 - [ ] Run CLI and launcher tests.
 

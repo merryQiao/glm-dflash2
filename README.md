@@ -85,9 +85,9 @@ teacher-forced previous target. The LM-head matmul stays BF16 and logits/loss
 normalization use FP32.
 
 The DSpark confidence soft target is `1 - 0.5 * full_vocab_L1`; its default
-GLM-5.2 recipe is one epoch, learning rate `3e-4`, gamma 4, and loss
-`0.1*CE + 0.9*L1 + 1.0*confidence_BCE`. DFlash/DFlash2 retain three epochs,
-learning rate `6e-4`, and gamma 7 by default.
+GLM-5.2 five-layer preview recipe is three epochs, learning rate `6e-4`, gamma 4, and loss
+`0.1*CE + 0.9*L1 + 1.0*confidence_BCE`. DFlash/DFlash2 retain three epochs
+and learning rate `6e-4`; gamma is 4 for B8 and 7 for B16.
 
 ## Quick local verification
 

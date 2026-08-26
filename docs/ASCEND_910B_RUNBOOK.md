@@ -117,8 +117,9 @@ bash scripts/train_glm52_drafter_910b.sh
 Use `METHOD=dflash`, `dflash2`, or `dspark`. DFlash and DFlash2 support
 `BLOCK_SIZE=8` and `16`; run both settings separately. DSpark supports only
 `BLOCK_SIZE=8`, whose layout is one anchor plus seven proposed tokens. Its
-default recipe is one epoch, `lr=3e-4`, gamma 4, rank-256 vanilla Markov,
+default recipe is three epochs, `lr=6e-4`, gamma 4, rank-256 vanilla Markov,
 Markov-aware confidence, and `0.1 CE + 0.9 full-vocab L1 + 1.0 BCE`.
+For DFlash and DFlash2, B8 also uses gamma 4 while B16 uses gamma 7.
 For multiple nodes, use identical
 arguments and set `NODE_RANK` uniquely. Resume only from a `COMPLETE` step and
 do not change cache identity, method, architecture, optimizer or scheduler.

@@ -42,8 +42,8 @@ class UnifiedTrainCliTest(unittest.TestCase):
         self.assertEqual(args.block_size, 8)
         self.assertEqual(args.num_anchors, 64)
         self.assertEqual(args.gamma, 4.0)
-        self.assertEqual(args.epochs, 1)
-        self.assertEqual(args.lr, 3e-4)
+        self.assertEqual(args.epochs, 3)
+        self.assertEqual(args.lr, 6e-4)
         self.assertEqual(args.selector_rank, 256)
         self.assertEqual(args.selector_top_k, 16)
         self.assertEqual(args.markov_rank, 256)
@@ -59,7 +59,9 @@ class UnifiedTrainCliTest(unittest.TestCase):
                 args = parser.parse_args(
                     ["--method", method, "--block-size", str(block_size), *base]
                 )
-                self.assertEqual(resolve_method_recipe(args).block_size, block_size)
+                args = resolve_method_recipe(args)
+                self.assertEqual(args.block_size, block_size)
+                self.assertEqual(args.gamma, 4.0 if block_size == 8 else 7.0)
         args = parser.parse_args(
             ["--method", "dspark", "--block-size", "16", *base]
         )
