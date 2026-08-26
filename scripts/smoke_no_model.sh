@@ -12,3 +12,4 @@ PYTHONPATH="$ROOT/src" "$PY" "$ROOT/tools/validate_hidden_cache.py" \
   --cache-dir "$SMOKE_DIR/hidden" \
   --expected-samples 1 \
   --full-scan
+bash "$ROOT/scripts/smoke_train_no_npu.sh"

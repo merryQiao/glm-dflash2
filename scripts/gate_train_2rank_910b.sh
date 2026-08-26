@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PY=${PY:-python}
+METHOD=${METHOD:-dflash2}
 CACHE_DIR=${CACHE_DIR:?set CACHE_DIR to a frozen 1-2 sample gate cache}
 TARGET_IO_DIR=${TARGET_IO_DIR:?set TARGET_IO_DIR}
 MASK_TOKEN_ID=${MASK_TOKEN_ID:?set MASK_TOKEN_ID}
@@ -21,7 +22,8 @@ run_train() {
   shift
   PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
     "$PY" -m torch.distributed.run --nproc_per_node=2 --master_port="$port" \
-    "$ROOT/tools/train_dflash2_offline.py" \
+    "$ROOT/tools/train_drafter_offline.py" \
+    --method "$METHOD" \
     --cache-dir "$CACHE_DIR" --target-io-dir "$TARGET_IO_DIR" \
     --mask-token-id "$MASK_TOKEN_ID" --device npu --epochs 2 \
     --grad-accum 1 --save-every 1 --log-every 1 "$@"
@@ -34,7 +36,7 @@ run_train "$((MASTER_PORT + 2))" --output-dir "$OUTPUT_DIR/resumed" \
   --resume "$OUTPUT_DIR/resumed/step-1" --max-steps 2
 
 TARGET_HASH_AFTER=$(sha256sum "$TARGET_IO_DIR/model.safetensors" | awk '{print $1}')
-GATE_OUTPUT="$OUTPUT_DIR" TARGET_HASH_BEFORE="$TARGET_HASH_BEFORE" \
+GATE_OUTPUT="$OUTPUT_DIR" GATE_METHOD="$METHOD" TARGET_HASH_BEFORE="$TARGET_HASH_BEFORE" \
 TARGET_HASH_AFTER="$TARGET_HASH_AFTER" "$PY" - <<'PY'
 import json, math, os
 from pathlib import Path
@@ -58,15 +60,17 @@ for name in ("direct", "resumed"):
     for line in (root / name / "train.jsonl").read_text().splitlines():
         record = json.loads(line)
         logs_finite &= all(
-            math.isfinite(float(record[field]))
-            for field in ("loss", "base_loss", "selector_loss", "grad_norm", "lr")
+            math.isfinite(float(value))
+            for value in record.values()
+            if isinstance(value, (int, float))
         )
 
 checkpoints = all((root / name / "step-2/COMPLETE").is_file() for name in ("direct", "resumed"))
 frozen = os.environ["TARGET_HASH_BEFORE"] == os.environ["TARGET_HASH_AFTER"]
 passed = bool(compare and finite and logs_finite and checkpoints and frozen)
 payload = {
-    "schema": "glm-dflash2-910b-train-gate-v2",
+    "schema": "glm-unified-910b-train-gate-v3",
+    "method": os.environ["GATE_METHOD"],
     "passed": passed,
     "uninterrupted_resume_exact": bool(compare),
     "all_export_tensors_finite": bool(finite),

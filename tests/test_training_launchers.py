@@ -45,6 +45,9 @@ class TrainingLaunchersTest(unittest.TestCase):
         self.assertIn("resumed", gate)
         self.assertIn("compare", gate)
         self.assertIn("gate-result.json", gate)
+        self.assertIn("METHOD", gate)
+        self.assertIn("train_drafter_offline.py", gate)
+        self.assertNotIn("train_dflash2_offline.py", gate)
 
     def test_training_launcher_supports_multinode_torchrun(self):
         text = (ROOT / "scripts/train_glm52_drafter_910b.sh").read_text()
@@ -59,6 +62,30 @@ class TrainingLaunchersTest(unittest.TestCase):
         ]
         self.assertFalse(any(line.startswith("torch") for line in lines))
         self.assertIn("transformers==4.57.3", lines)
+
+    def test_cpu_training_smoke_covers_all_three_aligned_methods(self):
+        text = (ROOT / "tools/smoke_train_tiny.py").read_text()
+        for method in ("dflash", "dflash2", "dspark"):
+            self.assertIn(f'"{method}"', text)
+        launcher = (ROOT / "scripts/smoke_no_model.sh").read_text()
+        self.assertIn("smoke_train_no_npu.sh", launcher)
+
+    def test_documentation_describes_unified_schema_v2_and_hardware_gate(self):
+        readme = (ROOT / "README.md").read_text()
+        for value in (
+            "DFlash",
+            "DFlash2",
+            "DSpark",
+            "aux_hidden_states.bin",
+            "target_final_hidden.bin",
+            "64/64",
+            "calibrate_hidden_capture_gate.py",
+        ):
+            self.assertIn(value, readme)
+        runbook = (ROOT / "docs/ASCEND_910B_RUNBOOK.md").read_text()
+        self.assertIn("real 910B", runbook)
+        self.assertIn("train_glm52_drafter_910b.sh", runbook)
+        self.assertIn("Legacy v1", runbook)
 
 
 if __name__ == "__main__":

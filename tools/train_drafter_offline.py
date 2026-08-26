@@ -168,7 +168,7 @@ def _sample_or_dummy_anchors(batch, trainer, *, epoch: int):
     try:
         anchors, keep = sample_anchor_positions(
             batch["loss_mask"],
-            sample_ids=batch["sample_id"],
+            sample_ids=batch["sample_ids"],
             global_seed=trainer.global_seed,
             epoch=epoch,
             attention_mask=batch.get("attention_mask"),

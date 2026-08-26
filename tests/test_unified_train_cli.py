@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import unittest
 
+import torch
+
 from glm_dflash2.dflash2_model import Qwen3DFlash2DraftModel, build_dflash2_config
 from glm_dflash2.draft_backbone import DFlashDraftModel
 from glm_dflash2.dspark_model import DSparkDraftModel
 from tools.train_drafter_offline import (
+    _sample_or_dummy_anchors,
     build_method_model,
     build_parser,
     validate_aligned_cache_manifest,
@@ -63,6 +66,25 @@ class UnifiedTrainCliTest(unittest.TestCase):
                     {"spec": {"schema_version": 1}, "aligned_methods_allowed": False},
                     method=method,
                 )
+
+    def test_anchor_sampling_consumes_collator_sample_ids(self):
+        class Draft:
+            block_size = 4
+
+        class Trainer:
+            draft_model = Draft()
+            global_seed = 42
+            num_anchors = 2
+
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+            "loss_mask": torch.ones(1, 4, dtype=torch.bool),
+            "sample_ids": ["stable-id"],
+        }
+        anchors, keep, local_has = _sample_or_dummy_anchors(batch, Trainer(), epoch=0)
+        self.assertTrue(local_has)
+        self.assertEqual(tuple(anchors.shape), tuple(keep.shape))
 
 
 if __name__ == "__main__":

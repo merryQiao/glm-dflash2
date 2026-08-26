@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from glm_dflash2.hidden_extraction import extract_trajectory_cache
+from glm_dflash2.hidden_capture import CaptureTap, TargetHiddenCapture
 from glm_dflash2.sglang_stage_a import CommittedJsonlWriter
 
 
@@ -19,10 +20,22 @@ class MockRunner:
     hidden_size = 4
     physical_layer_ids = (2, 21, 39, 57, 76)
     backend_metadata = {"backend": "mock", "version": "1"}
+    capture_mapping = tuple(
+        CaptureTap("mock", logical, f"tap-{physical}", "post_decoder_block")
+        for logical, physical in zip((1, 20, 38, 56, 75), physical_layer_ids)
+    )
 
     def extract(self, input_ids):
         values = torch.arange(len(input_ids) * 5 * self.hidden_size)
-        return values.reshape(len(input_ids), 5, self.hidden_size).to(torch.bfloat16)
+        return TargetHiddenCapture(
+            aux_hidden_states=values.reshape(
+                len(input_ids), 5, self.hidden_size
+            ).to(torch.bfloat16),
+            target_final_hidden=torch.arange(
+                len(input_ids) * self.hidden_size
+            ).reshape(len(input_ids), self.hidden_size).to(torch.bfloat16),
+            capture_mapping=self.capture_mapping,
+        )
 
 
 def main() -> int:

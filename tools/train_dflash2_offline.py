@@ -26,9 +26,9 @@ def main(argv: list[str] | None = None) -> int:
 def _sample_or_dummy_anchors(batch, trainer):
     """Compatibility helper using the first epoch's deterministic anchors."""
 
-    if "sample_id" not in batch:
+    if "sample_ids" not in batch:
         batch = dict(batch)
-        batch["sample_id"] = [
+        batch["sample_ids"] = [
             f"legacy-row-{row}" for row in range(int(batch["input_ids"].shape[0]))
         ]
     return _sample_anchors(batch, trainer, epoch=0)
