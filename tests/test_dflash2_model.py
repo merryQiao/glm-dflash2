@@ -21,16 +21,15 @@ class DFlash2ModelTest(unittest.TestCase):
         self.assertEqual(config.hidden_size, 6144)
         self.assertEqual(config.intermediate_size, 12288)
         self.assertEqual(config.num_hidden_layers, 5)
-        self.assertEqual(config.num_attention_heads, 32)
-        self.assertEqual(config.num_key_value_heads, 8)
-        self.assertEqual(config.head_dim, 128)
+        self.assertEqual(config.num_attention_heads, 64)
+        self.assertEqual(config.num_key_value_heads, 64)
+        self.assertEqual(config.head_dim, 64)
         self.assertEqual(config.rms_norm_eps, 1e-5)
         self.assertEqual(config.rope_theta, 8_000_000)
-        self.assertEqual(config.layer_types, ["sliding_attention"] * 5)
+        self.assertEqual(config.layer_types, ["full_attention"] * 5)
         self.assertFalse(config.is_causal)
-        self.assertTrue(config.use_sliding_window)
-        self.assertEqual(config.sliding_window, 2048)
-        self.assertEqual(config.max_window_layers, 5)
+        self.assertFalse(config.use_sliding_window)
+        self.assertIsNone(config.sliding_window)
         expected = {
             "block_size": 16,
             "mask_token_id": 154879,

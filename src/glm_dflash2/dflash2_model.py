@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from .glm_draft_config import GLM52_DRAFT_SPEC
+
 
 GLM52_TARGET_LAYER_IDS = [1, 20, 38, 56, 75]
 
@@ -28,7 +30,7 @@ def build_dflash2_config(
     conv_group_size: int,
     selector_rank: int,
     selector_top_k: int,
-    sliding_window: int,
+    sliding_window: int | None,
     conv_kernel_size: int = 2,
     rms_norm_eps: float = 1e-5,
     rope_theta: float = 8_000_000.0,
@@ -46,6 +48,7 @@ def build_dflash2_config(
         "selector_rank": int(selector_rank),
         "selector_top_k": int(selector_top_k),
     }
+    use_sliding_window = sliding_window is not None
     config = Qwen3Config(
         vocab_size=int(vocab_size),
         hidden_size=int(hidden_size),
@@ -61,10 +64,13 @@ def build_dflash2_config(
         attention_bias=False,
         attention_dropout=0.0,
         use_cache=True,
-        use_sliding_window=True,
-        sliding_window=int(sliding_window),
-        max_window_layers=int(num_hidden_layers),
-        layer_types=["sliding_attention"] * int(num_hidden_layers),
+        use_sliding_window=use_sliding_window,
+        sliding_window=None if sliding_window is None else int(sliding_window),
+        max_window_layers=int(num_hidden_layers) if use_sliding_window else 0,
+        layer_types=[
+            "sliding_attention" if use_sliding_window else "full_attention"
+        ]
+        * int(num_hidden_layers),
     )
     config.architectures = ["DFlash2DraftModel"]
     config.is_causal = False
@@ -76,22 +82,25 @@ def build_dflash2_config(
 
 
 def build_glm52_dflash2_config(*, vocab_size: int, mask_token_id: int) -> Qwen3Config:
+    spec = GLM52_DRAFT_SPEC
     return build_dflash2_config(
         vocab_size=vocab_size,
-        hidden_size=6144,
-        intermediate_size=12288,
-        num_hidden_layers=5,
-        num_attention_heads=32,
-        num_key_value_heads=8,
-        head_dim=128,
-        target_layer_ids=GLM52_TARGET_LAYER_IDS,
-        num_target_layers=78,
-        block_size=16,
+        hidden_size=spec.hidden_size,
+        intermediate_size=spec.intermediate_size,
+        num_hidden_layers=spec.num_hidden_layers,
+        num_attention_heads=spec.num_attention_heads,
+        num_key_value_heads=spec.num_key_value_heads,
+        head_dim=spec.head_dim,
+        target_layer_ids=spec.target_layer_ids,
+        num_target_layers=spec.target_num_hidden_layers,
+        block_size=spec.block_size,
         mask_token_id=mask_token_id,
         conv_group_size=16,
         selector_rank=256,
         selector_top_k=16,
-        sliding_window=2048,
+        sliding_window=spec.sliding_window,
+        rms_norm_eps=spec.rms_norm_eps,
+        rope_theta=spec.rope_theta,
         max_position_embeddings=1_048_576,
     )
 
