@@ -16,15 +16,20 @@ class TrainingLaunchersTest(unittest.TestCase):
             "TARGET_IO_DIR",
             "MASK_TOKEN_ID",
             "--device npu",
-            "--block-size 16",
+            "BLOCK_SIZE",
+            '--block-size "$BLOCK_SIZE"',
             "--num-anchors 64",
-            "--gamma 7",
+            '--gamma "${GAMMA:-$default_gamma}"',
             "--selector-rank 256",
             "--selector-top-k 16",
             "--hidden-size 6144",
             "--intermediate-size 12288",
             "--num-draft-layers 5",
             "train_drafter_offline.py",
+            'DSpark requires BLOCK_SIZE=8',
+            'dspark_lr=3e-4',
+            'dspark_epochs=1',
+            'dspark_gamma=4',
         ):
             self.assertIn(value, text)
         self.assertNotIn("TARGET_MODEL", text)
@@ -46,6 +51,8 @@ class TrainingLaunchersTest(unittest.TestCase):
         self.assertIn("compare", gate)
         self.assertIn("gate-result.json", gate)
         self.assertIn("METHOD", gate)
+        self.assertIn("BLOCK_SIZE", gate)
+        self.assertIn('--block-size "$BLOCK_SIZE"', gate)
         self.assertIn("train_drafter_offline.py", gate)
         self.assertNotIn("train_dflash2_offline.py", gate)
 

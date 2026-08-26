@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import torch
 from torch import nn
@@ -95,6 +96,25 @@ class DSparkTrainerTest(unittest.TestCase):
         del batch["target_final_hidden"]
         with self.assertRaisesRegex(ValueError, "target_final_hidden"):
             trainer(batch, anchor_positions=anchors, block_keep_mask=keep)
+
+    def test_confidence_head_receives_teacher_forced_predecessors(self):
+        trainer, batch, anchors, keep = self._fixture()
+        seen = []
+        original = trainer.draft_model.confidence_logits
+
+        def remember(hidden, predecessors):
+            seen.append(predecessors.detach().clone())
+            return original(hidden, predecessors)
+
+        with mock.patch.object(
+            trainer.draft_model, "confidence_logits", side_effect=remember
+        ):
+            trainer(batch, anchor_positions=anchors, block_keep_mask=keep)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(
+            seen[0].tolist(),
+            [[[1, 2, 3], [4, 5, 6]]],
+        )
 
 
 if __name__ == "__main__":

@@ -105,6 +105,7 @@ markers and exact uninterrupted-vs-resume output parity.
 
 ```bash
 METHOD=dspark \
+BLOCK_SIZE=8 \
 CACHE_DIR=/shared/out/hidden-v2-frozen \
 TARGET_IO_DIR=/shared/out/glm52-target-io \
 OUTPUT_DIR=/shared/out/glm52-dspark \
@@ -113,7 +114,12 @@ NUM_NPUS=8 NNODES=1 NODE_RANK=0 \
 bash scripts/train_glm52_drafter_910b.sh
 ```
 
-Use `METHOD=dflash`, `dflash2`, or `dspark`. For multiple nodes, use identical
+Use `METHOD=dflash`, `dflash2`, or `dspark`. DFlash and DFlash2 support
+`BLOCK_SIZE=8` and `16`; run both settings separately. DSpark supports only
+`BLOCK_SIZE=8`, whose layout is one anchor plus seven proposed tokens. Its
+default recipe is one epoch, `lr=3e-4`, gamma 4, rank-256 vanilla Markov,
+Markov-aware confidence, and `0.1 CE + 0.9 full-vocab L1 + 1.0 BCE`.
+For multiple nodes, use identical
 arguments and set `NODE_RANK` uniquely. Resume only from a `COMPLETE` step and
 do not change cache identity, method, architecture, optimizer or scheduler.
 

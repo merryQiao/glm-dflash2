@@ -81,7 +81,9 @@ def build_dflash2_config(
     return config
 
 
-def build_glm52_dflash2_config(*, vocab_size: int, mask_token_id: int) -> Qwen3Config:
+def build_glm52_dflash2_config(
+    *, vocab_size: int, mask_token_id: int, block_size: int = 16
+) -> Qwen3Config:
     spec = GLM52_DRAFT_SPEC
     return build_dflash2_config(
         vocab_size=vocab_size,
@@ -93,7 +95,7 @@ def build_glm52_dflash2_config(*, vocab_size: int, mask_token_id: int) -> Qwen3C
         head_dim=spec.head_dim,
         target_layer_ids=spec.target_layer_ids,
         num_target_layers=spec.target_num_hidden_layers,
-        block_size=spec.block_size,
+        block_size=int(block_size),
         mask_token_id=mask_token_id,
         conv_group_size=16,
         selector_rank=256,

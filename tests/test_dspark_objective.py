@@ -35,13 +35,11 @@ class DSparkObjectiveTest(unittest.TestCase):
             torch.bfloat16
         )
         with torch.no_grad():
-            markov.predecessor_codebook.zero_()
-            markov.successor_codebook.zero_()
-            markov.hidden_projection.weight.zero_()
-            markov.predecessor_codebook[1] = torch.tensor([1.0, 0.5])
-            markov.predecessor_codebook[2] = torch.tensor([0.25, 1.0])
-            markov.successor_codebook[3] = torch.tensor([0.5, -0.25])
-            markov.hidden_projection.weight[:, :2] = torch.eye(2)
+            markov.markov_w1.weight.zero_()
+            markov.markov_w2.weight.zero_()
+            markov.markov_w1.weight[1] = torch.tensor([1.0, 0.5])
+            markov.markov_w1.weight[2] = torch.tensor([0.25, 1.0])
+            markov.markov_w2.weight[3] = torch.tensor([0.5, -0.25])
         return draft, teacher, weight, markov
 
     def test_reconstructs_teacher_logits_with_bf16_matmul(self):

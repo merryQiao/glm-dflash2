@@ -12,8 +12,10 @@ The production contract is fixed:
 - auxiliary hidden `[T,5,6144]` plus post-final-norm hidden `[T,6144]`;
 - five-layer draft, hidden/intermediate `6144/12288`;
 - `64/64` query/KV heads, head dimension 64, full attention, no sliding window;
-- RoPE theta `8e6`, RMS epsilon `1e-5`, block size 16;
-- one clean anchor plus 15 jointly visible draft positions.
+- RoPE theta `8e6`, RMS epsilon `1e-5`;
+- DFlash and DFlash2 train physical block sizes 8 and 16; DSpark trains only
+  physical block size 8. A physical block contains one clean anchor, so B8/B16
+  predict 7/15 speculative tokens respectively.
 
 See [AI_HANDOFF.md](AI_HANDOFF.md) for project context and
 [docs/ASCEND_910B_RUNBOOK.md](docs/ASCEND_910B_RUNBOOK.md) for executable
@@ -71,8 +73,9 @@ about 46.4 TB, so storage planning is mandatory.
 - **DFlash2:** the same backbone plus identity-initialized two-tap grouped
   dynamic convolution and a rank-256/top-16 candidate selector. It uses base CE
   plus selector CE when the target occurs in base top-16.
-- **DSpark:** the plain common backbone plus a rank-256 predecessor-conditioned
-  Markov head and confidence head. Target distributions are reconstructed from
+- **DSpark:** the plain common backbone plus the official rank-256 vanilla
+  Markov head `Embedding(V,256) -> Linear(256,V)` and a Markov-aware confidence
+  head. Target distributions are reconstructed from
   `target_final_hidden @ frozen_lm_head.T`; its exact chunked loss is
   `0.1*CE + 0.9*full_vocab_L1 + 1.0*BCE`.
 
@@ -80,6 +83,11 @@ For DSpark, target token position `p` uses final hidden position `p-1`. At
 depth zero the predecessor is the clean anchor; later depths use the
 teacher-forced previous target. The LM-head matmul stays BF16 and logits/loss
 normalization use FP32.
+
+The DSpark confidence soft target is `1 - 0.5 * full_vocab_L1`; its default
+GLM-5.2 recipe is one epoch, learning rate `3e-4`, gamma 4, and loss
+`0.1*CE + 0.9*L1 + 1.0*confidence_BCE`. DFlash/DFlash2 retain three epochs,
+learning rate `6e-4`, and gamma 7 by default.
 
 ## Quick local verification
 
@@ -126,6 +134,7 @@ Train any aligned method:
 
 ```bash
 METHOD=dflash2 \
+BLOCK_SIZE=16 \
 CACHE_DIR=/shared/out/hidden-v2 \
 TARGET_IO_DIR=/shared/out/glm52-target-io \
 OUTPUT_DIR=/shared/out/glm52-dflash2 \
@@ -134,7 +143,8 @@ NUM_NPUS=8 \
 bash scripts/train_glm52_drafter_910b.sh
 ```
 
-Set `METHOD=dflash`, `dflash2`, or `dspark`. Multi-node training also accepts
+Set `METHOD=dflash`, `dflash2`, or `dspark`. DFlash/DFlash2 accept
+`BLOCK_SIZE=8` or `16`; DSpark requires `BLOCK_SIZE=8`. Multi-node training also accepts
 `NNODES`, `NODE_RANK`, `MASTER_ADDR`, and `MASTER_PORT`. The deprecated
 `train_glm52_dflash2_910b.sh` is only a compatibility wrapper.
 

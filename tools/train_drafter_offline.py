@@ -62,10 +62,14 @@ def build_parser(*, default_method: str | None = None) -> argparse.ArgumentParse
     parser.add_argument("--mask-token-id", type=int, required=True)
     parser.add_argument("--pad-token-id", type=int, default=0)
     parser.add_argument("--device", choices=("npu", "cuda", "cpu"), default="npu")
-    parser.add_argument("--epochs", type=int, default=3)
+    default_epochs = 1 if default_method == "dspark" else 3 if default_method else None
+    default_lr = 3e-4 if default_method == "dspark" else 6e-4 if default_method else None
+    default_block = 8 if default_method == "dspark" else 16 if default_method else None
+    default_gamma = 4.0 if default_method == "dspark" else 7.0 if default_method else None
+    parser.add_argument("--epochs", type=int, default=default_epochs)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=6e-4)
+    parser.add_argument("--lr", type=float, default=default_lr)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
@@ -80,9 +84,9 @@ def build_parser(*, default_method: str | None = None) -> argparse.ArgumentParse
     parser.add_argument("--token-chunk-size", type=int, default=256)
     parser.add_argument("--vocab-chunk-size", type=int, default=4096)
     # Aligned experiment constants are choices rather than mutable architecture knobs.
-    parser.add_argument("--block-size", type=int, choices=(16,), default=16)
+    parser.add_argument("--block-size", type=int, choices=(8, 16), default=default_block)
     parser.add_argument("--num-anchors", type=int, choices=(64,), default=64)
-    parser.add_argument("--gamma", type=float, choices=(7.0,), default=7.0)
+    parser.add_argument("--gamma", type=float, choices=(4.0, 7.0), default=default_gamma)
     parser.add_argument("--selector-rank", type=int, choices=(256,), default=256)
     parser.add_argument("--selector-top-k", type=int, choices=(16,), default=16)
     parser.add_argument("--markov-rank", type=int, choices=(256,), default=256)
@@ -91,6 +95,21 @@ def build_parser(*, default_method: str | None = None) -> argparse.ArgumentParse
     parser.add_argument("--num-draft-layers", type=int, choices=(5,), default=5)
     parser.set_defaults(fsdp2=True)
     return parser
+
+
+def resolve_method_recipe(args: argparse.Namespace) -> argparse.Namespace:
+    """Fill and validate method-specific experiment defaults."""
+
+    if args.method == "dspark":
+        defaults = {"block_size": 8, "epochs": 1, "lr": 3e-4, "gamma": 4.0}
+    else:
+        defaults = {"block_size": 16, "epochs": 3, "lr": 6e-4, "gamma": 7.0}
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    if args.method == "dspark" and args.block_size != 8:
+        raise ValueError("DSpark requires physical block-size 8 (one anchor + seven proposals)")
+    return args
 
 
 def validate_aligned_cache_manifest(
@@ -111,6 +130,8 @@ def build_method_model(method: str, config, *, markov_rank: int = 256):
     config.drafter_method = method
     config.position_contract = "absolute_anchor_plus_local"
     config.target_layer_ids = list(config.dflash_config["target_layer_ids"])
+    config.physical_block_size = int(config.dflash_config["block_size"])
+    config.num_speculative_tokens = config.physical_block_size - 1
     if method == "dflash":
         config.architectures = ["DFlashDraftModel"]
         return DFlashDraftModel(config)
@@ -211,6 +232,11 @@ def _semantic_config(args, dataset, target_io, total_steps: int) -> dict[str, An
                 "selector_top_k", "markov_rank", "hidden_size", "intermediate_size",
                 "num_draft_layers",
             )
+        },
+        "block_contract": {
+            "physical_block_size": int(args.block_size),
+            "anchor_tokens": 1,
+            "speculative_tokens": int(args.block_size) - 1,
         },
         "total_optimizer_steps": int(total_steps),
     }
@@ -330,7 +356,9 @@ def _export(model, config, output_dir: Path, is_main: bool, target_io_manifest) 
 
 
 def main(argv: list[str] | None = None, *, default_method: str | None = None) -> int:
-    args = build_parser(default_method=default_method).parse_args(argv)
+    args = resolve_method_recipe(
+        build_parser(default_method=default_method).parse_args(argv)
+    )
     context = initialize_distributed(args.device)
     rank_seed = rank_epoch_seed(args.seed, context.rank, 0)
     random.seed(rank_seed)
@@ -350,6 +378,7 @@ def main(argv: list[str] | None = None, *, default_method: str | None = None) ->
         config = build_glm52_dflash2_config(
             vocab_size=int(target_io.manifest["vocab_size"]),
             mask_token_id=args.mask_token_id,
+            block_size=args.block_size,
         )
         draft = build_method_model(
             args.method, config, markov_rank=args.markov_rank

@@ -487,7 +487,9 @@ class OfflineDSparkTrainer(_OfflineDFlashBase):
             prepared.blocks.block_keep_mask,
             prediction_depth=prepared.pred_hidden.shape[-2],
         )
-        confidence_logits = self.draft_model.confidence_logits(prepared.pred_hidden)
+        confidence_logits = self.draft_model.confidence_logits(
+            prepared.pred_hidden, predecessors
+        )
         losses = compute_dspark_loss(
             draft_hidden=prepared.pred_hidden,
             target_hidden=teacher_hidden.to(prepared.pred_hidden.dtype),

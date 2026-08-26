@@ -28,7 +28,9 @@ rather than the Qwen3.8 DFlash2 checkpoint:
 - sliding window: disabled;
 - RoPE theta: 8,000,000;
 - RMS norm epsilon: `1e-5`;
-- block size: 16, represented by one known anchor and 15 predicted tokens.
+- physical block size is method-level: DFlash and DFlash2 use B8 and B16;
+  DSpark uses only B8. Every physical block contains one known anchor, so B8
+  predicts seven tokens and B16 predicts fifteen.
 
 The attention projections do not derive `head_dim` from `hidden_size / heads`.
 Q, K, and V each have width `64 * 64 = 4096`, and the output projection maps
@@ -154,7 +156,8 @@ deliberately substitute a pre-norm tensor and shift one layer ID; both must fail
 ### DFlash
 
 Consumes `input_ids`, `loss_mask`, and the five auxiliary hidden layers. It uses
-the common backbone and hard-token block CE. For predicted depths `d=0..14`,
+the common backbone and hard-token block CE. For physical block size `B` and
+predicted depths `d=0..B-2`,
 `y_d = input_ids[a+d+1]`, and
 
 ```text
@@ -198,19 +201,22 @@ L_conf = sum_d w_d * BCEWithLogits(c_d, stopgrad(accept_target_d)) / sum_d w_d
 L = 0.1 * L_CE + 0.9 * L_L1 + 1.0 * L_conf
 ```
 
-The Markov head applies its low-rank logit bias before `q_d` is computed. Its
-predecessor IDs follow the same teacher-forced convention as the DFlash2
-selector. All numerators and denominators are reduced globally. The coefficients
-remain explicit experiment configuration rather than hidden-cache metadata.
+The Markov head is the official vanilla rank-256
+`Embedding(V,256) -> Linear(256,V)` predecessor-token bias and applies before
+`q_d` is computed; it does not gate on draft hidden. The confidence predictor
+receives the concatenation of draft hidden and the same Markov predecessor
+embedding. Predecessor IDs follow the same teacher-forced convention as the
+DFlash2 selector. All numerators and denominators are reduced globally.
+DSpark defaults to one epoch, learning rate `3e-4`, gamma 4, and physical B8.
 
 ## Block and mask contract
 
-For block size 16 and anchor token index `a`:
+For physical block size `B` and anchor token index `a`:
 
 ```text
-target: [input_ids[a], input_ids[a+1], ..., input_ids[a+15]]
+target: [input_ids[a], input_ids[a+1], ..., input_ids[a+B-1]]
 noise:  [input_ids[a], MASK,           ..., MASK]
-loss:   [ignore,       predict a+1,     ..., predict a+15]
+loss:   [ignore,       predict a+1,     ..., predict a+B-1]
 ```
 
 An anchor is eligible iff `loss_mask[a] == 1`, `loss_mask[a+1] == 1`, and the
@@ -223,12 +229,12 @@ the same nominal block cannot become valid again.
 
 Every draft query may attend to auxiliary context rows with absolute positions
 `< a`, never row `a` or successor rows. The known anchor is supplied only by its
-token embedding in local draft slot 0. Every draft query may attend to all 16
-local draft slots, whose contents are one anchor plus 15 masks. Raw future token
+token embedding in local draft slot 0. Every draft query may attend to all `B`
+local draft slots, whose contents are one anchor plus `B-1` masks. Raw future token
 embeddings and auxiliary rows at positions `>= a` are forbidden.
 
 RoPE always uses absolute sequence positions. Auxiliary row `t` uses position
-ID `t`; local draft slot `j=0..15` uses position ID `a+j`. Block-relative RoPE is
+ID `t`; local draft slot `j=0..B-1` uses position ID `a+j`. Block-relative RoPE is
 forbidden. Training, exported configuration, and serving use this identical
 convention.
 

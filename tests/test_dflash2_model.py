@@ -16,7 +16,9 @@ from glm_dflash2.draft_backbone import GLMDraftBackbone
 
 class DFlash2ModelTest(unittest.TestCase):
     def test_glm52_export_config_is_complete_and_fixed(self):
-        config = build_glm52_dflash2_config(vocab_size=154880, mask_token_id=154879)
+        config = build_glm52_dflash2_config(
+            vocab_size=154880, mask_token_id=154879, block_size=8
+        )
         self.assertEqual(config.model_type, "qwen3")
         self.assertEqual(config.architectures, ["DFlash2DraftModel"])
         self.assertEqual(config.hidden_size, 6144)
@@ -32,7 +34,7 @@ class DFlash2ModelTest(unittest.TestCase):
         self.assertFalse(config.use_sliding_window)
         self.assertIsNone(config.sliding_window)
         expected = {
-            "block_size": 16,
+            "block_size": 8,
             "mask_token_id": 154879,
             "target_layer_ids": [1, 20, 38, 56, 75],
             "num_target_layers": 78,

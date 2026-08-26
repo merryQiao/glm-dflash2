@@ -4,9 +4,10 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PY=${PY:-python}
 METHOD=${METHOD:?set METHOD to dflash, dflash2, or dspark}
+BLOCK_SIZE=${BLOCK_SIZE:?set BLOCK_SIZE to 8 or 16}
 CACHE_DIR=${CACHE_DIR:?set CACHE_DIR to the aligned schema-v2 hidden cache}
 TARGET_IO_DIR=${TARGET_IO_DIR:?set TARGET_IO_DIR to the extracted GLM token I/O}
-OUTPUT_DIR=${OUTPUT_DIR:-$ROOT/outputs/glm52_${METHOD}_b16}
+OUTPUT_DIR=${OUTPUT_DIR:-$ROOT/outputs/glm52_${METHOD}_b${BLOCK_SIZE}}
 MASK_TOKEN_ID=${MASK_TOKEN_ID:?set the real tokenizer MASK token id explicitly}
 NUM_NPUS=${NUM_NPUS:-8}
 NNODES=${NNODES:-1}
@@ -18,6 +19,26 @@ case "$METHOD" in
   dflash|dflash2|dspark) ;;
   *) echo "METHOD must be dflash, dflash2, or dspark" >&2; exit 2 ;;
 esac
+case "$BLOCK_SIZE" in
+  8|16) ;;
+  *) echo "BLOCK_SIZE must be 8 or 16" >&2; exit 2 ;;
+esac
+if [[ "$METHOD" == "dspark" && "$BLOCK_SIZE" != "8" ]]; then
+  echo "DSpark requires BLOCK_SIZE=8 (one anchor + seven proposals)" >&2
+  exit 2
+fi
+dspark_lr=3e-4
+dspark_epochs=1
+dspark_gamma=4
+if [[ "$METHOD" == "dspark" ]]; then
+  default_lr=$dspark_lr
+  default_epochs=$dspark_epochs
+  default_gamma=$dspark_gamma
+else
+  default_lr=6e-4
+  default_epochs=3
+  default_gamma=7
+fi
 if (( NNODES > 1 )) && [[ "$MASTER_ADDR" == "127.0.0.1" ]]; then
   echo "MASTER_ADDR must identify rank-0 host when NNODES>1" >&2
   exit 2
@@ -47,10 +68,10 @@ PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
   --mask-token-id "$MASK_TOKEN_ID" \
   --pad-token-id "${PAD_TOKEN_ID:-0}" \
   --device npu \
-  --epochs "${EPOCHS:-3}" \
+  --epochs "${EPOCHS:-$default_epochs}" \
   --batch-size "${BATCH_SIZE:-1}" \
   --grad-accum "${GRAD_ACCUM:-8}" \
-  --lr "${LR:-6e-4}" \
+  --lr "${LR:-$default_lr}" \
   --beta1 "${BETA1:-0.9}" \
   --beta2 "${BETA2:-0.95}" \
   --weight-decay "${WEIGHT_DECAY:-0.0}" \
@@ -59,9 +80,9 @@ PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
   --log-every "${LOG_EVERY:-10}" \
   --token-chunk-size "${TOKEN_CHUNK_SIZE:-256}" \
   --vocab-chunk-size "${VOCAB_CHUNK_SIZE:-4096}" \
-  --block-size 16 \
+  --block-size "$BLOCK_SIZE" \
   --num-anchors 64 \
-  --gamma 7 \
+  --gamma "${GAMMA:-$default_gamma}" \
   --selector-rank 256 \
   --selector-top-k 16 \
   --markov-rank 256 \

@@ -11,6 +11,7 @@ from tools.train_drafter_offline import (
     _sample_or_dummy_anchors,
     build_method_model,
     build_parser,
+    resolve_method_recipe,
     validate_aligned_cache_manifest,
 )
 
@@ -37,12 +38,33 @@ class UnifiedTrainCliTest(unittest.TestCase):
             ]
         )
         self.assertEqual(args.method, "dspark")
-        self.assertEqual(args.block_size, 16)
+        args = resolve_method_recipe(args)
+        self.assertEqual(args.block_size, 8)
         self.assertEqual(args.num_anchors, 64)
-        self.assertEqual(args.gamma, 7.0)
+        self.assertEqual(args.gamma, 4.0)
+        self.assertEqual(args.epochs, 1)
+        self.assertEqual(args.lr, 3e-4)
         self.assertEqual(args.selector_rank, 256)
         self.assertEqual(args.selector_top_k, 16)
         self.assertEqual(args.markov_rank, 256)
+
+    def test_method_recipe_allows_requested_block_matrix_only(self):
+        parser = build_parser()
+        base = [
+            "--cache-dir", "/cache", "--target-io-dir", "/io",
+            "--output-dir", "/out", "--mask-token-id", "9",
+        ]
+        for method in ("dflash", "dflash2"):
+            for block_size in (8, 16):
+                args = parser.parse_args(
+                    ["--method", method, "--block-size", str(block_size), *base]
+                )
+                self.assertEqual(resolve_method_recipe(args).block_size, block_size)
+        args = parser.parse_args(
+            ["--method", "dspark", "--block-size", "16", *base]
+        )
+        with self.assertRaisesRegex(ValueError, "DSpark.*block-size 8"):
+            resolve_method_recipe(args)
 
     def test_method_dispatch_changes_only_method_specific_modules(self):
         expected = {
@@ -58,6 +80,8 @@ class UnifiedTrainCliTest(unittest.TestCase):
                 self.assertIsNone(model.config.sliding_window)
                 self.assertEqual(model.config.drafter_method, method)
                 self.assertEqual(model.config.position_contract, "absolute_anchor_plus_local")
+                self.assertEqual(model.config.physical_block_size, 4)
+                self.assertEqual(model.config.num_speculative_tokens, 3)
 
     def test_all_aligned_methods_reject_legacy_cache(self):
         for method in ("dflash", "dflash2", "dspark"):

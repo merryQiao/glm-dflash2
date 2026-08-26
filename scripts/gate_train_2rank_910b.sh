@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PY=${PY:-python}
 METHOD=${METHOD:-dflash2}
+if [[ -z "${BLOCK_SIZE:-}" ]]; then
+  if [[ "$METHOD" == "dspark" ]]; then BLOCK_SIZE=8; else BLOCK_SIZE=16; fi
+fi
+if [[ "$METHOD" == "dspark" && "$BLOCK_SIZE" != "8" ]]; then
+  echo "DSpark requires BLOCK_SIZE=8" >&2
+  exit 2
+fi
 CACHE_DIR=${CACHE_DIR:?set CACHE_DIR to a frozen 1-2 sample gate cache}
 TARGET_IO_DIR=${TARGET_IO_DIR:?set TARGET_IO_DIR}
 MASK_TOKEN_ID=${MASK_TOKEN_ID:?set MASK_TOKEN_ID}
@@ -24,6 +31,7 @@ run_train() {
     "$PY" -m torch.distributed.run --nproc_per_node=2 --master_port="$port" \
     "$ROOT/tools/train_drafter_offline.py" \
     --method "$METHOD" \
+    --block-size "$BLOCK_SIZE" \
     --cache-dir "$CACHE_DIR" --target-io-dir "$TARGET_IO_DIR" \
     --mask-token-id "$MASK_TOKEN_ID" --device npu --epochs 2 \
     --grad-accum 1 --save-every 1 --log-every 1 "$@"
@@ -36,7 +44,8 @@ run_train "$((MASTER_PORT + 2))" --output-dir "$OUTPUT_DIR/resumed" \
   --resume "$OUTPUT_DIR/resumed/step-1" --max-steps 2
 
 TARGET_HASH_AFTER=$(sha256sum "$TARGET_IO_DIR/model.safetensors" | awk '{print $1}')
-GATE_OUTPUT="$OUTPUT_DIR" GATE_METHOD="$METHOD" TARGET_HASH_BEFORE="$TARGET_HASH_BEFORE" \
+GATE_OUTPUT="$OUTPUT_DIR" GATE_METHOD="$METHOD" GATE_BLOCK_SIZE="$BLOCK_SIZE" \
+TARGET_HASH_BEFORE="$TARGET_HASH_BEFORE" \
 TARGET_HASH_AFTER="$TARGET_HASH_AFTER" "$PY" - <<'PY'
 import json, math, os
 from pathlib import Path
@@ -71,6 +80,7 @@ passed = bool(compare and finite and logs_finite and checkpoints and frozen)
 payload = {
     "schema": "glm-unified-910b-train-gate-v3",
     "method": os.environ["GATE_METHOD"],
+    "physical_block_size": int(os.environ["GATE_BLOCK_SIZE"]),
     "passed": passed,
     "uninterrupted_resume_exact": bool(compare),
     "all_export_tensors_finite": bool(finite),
