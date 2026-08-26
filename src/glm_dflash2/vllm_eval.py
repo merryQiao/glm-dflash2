@@ -208,7 +208,22 @@ def compare_benchmark_results(
     speculative_tps = float(speculative["summary"]["tps"])
     if baseline_tps <= 0:
         raise ValueError("baseline TPS must be positive")
-    spec_decode = dict(speculative.get("spec_decode") or {})
+    spec_decode = speculative.get("spec_decode")
+    required_spec_metrics = {
+        "drafts",
+        "draft_tokens",
+        "accepted_tokens",
+        "mean_acceptance_length",
+        "draft_acceptance_rate",
+    }
+    if not isinstance(spec_decode, Mapping) or not required_spec_metrics.issubset(
+        spec_decode
+    ):
+        raise ValueError(
+            "speculative run is missing active speculative-decoding metrics"
+        )
+    if float(spec_decode["drafts"]) <= 0 or float(spec_decode["draft_tokens"]) <= 0:
+        raise ValueError("speculative run reported no active draft steps")
     return {
         "schema": "glm-vllm-ascend-comparison-v1",
         "baseline_tps": baseline_tps,
@@ -216,7 +231,7 @@ def compare_benchmark_results(
         "speedup": speculative_tps / baseline_tps,
         "exact_output_match": exact,
         "exact_output_match_rate": sum(matches) / len(matches),
-        "mean_acceptance_length": spec_decode.get("mean_acceptance_length"),
-        "draft_acceptance_rate": spec_decode.get("draft_acceptance_rate"),
-        "drafts": spec_decode.get("drafts"),
+        "mean_acceptance_length": spec_decode["mean_acceptance_length"],
+        "draft_acceptance_rate": spec_decode["draft_acceptance_rate"],
+        "drafts": spec_decode["drafts"],
     }

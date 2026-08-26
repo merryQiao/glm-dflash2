@@ -41,14 +41,14 @@ def _canonical_json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def load_verified_endpoint_manifest(
+def load_endpoint_manifest_attestation(
     path: str | Path,
     *,
     expected_model_fingerprint: str,
     expected_tokenizer_fingerprint: str,
     expected_served_model_name: str,
 ) -> dict[str, Any]:
-    """Validate the immutable identity advertised by an external SGLang server."""
+    """Validate an operator claim without pretending the endpoint proved its weights."""
 
     manifest_path = Path(path)
     if not manifest_path.is_file():
@@ -78,6 +78,8 @@ def load_verified_endpoint_manifest(
         "manifest": value,
         "sha256": hashlib.sha256(canonical).hexdigest(),
         "path": str(manifest_path.resolve()),
+        "weight_identity_status": "operator_attested",
+        "weight_identity_verified": False,
     }
 
 
@@ -113,7 +115,7 @@ def validate_local_model_artifacts(model_path: Path) -> None:
 
 
 def local_model_fingerprint(model_path: Path) -> str:
-    """Fingerprint configs, indexes and local weight artifacts without hashing a 700B model in full."""
+    """Fingerprint the full content of every config, index, tokenizer and weight shard."""
 
     validate_local_model_artifacts(model_path)
     digest = hashlib.sha256()
@@ -122,17 +124,11 @@ def local_model_fingerprint(model_path: Path) -> str:
         relative = path.relative_to(model_path).as_posix()
         digest.update(f"config\0{relative}\0{path.stat().st_size}\0".encode())
         _update_file_content(digest, path)
-    sample_bytes = 1024 * 1024
     for path in weights:
         stat = path.stat()
         relative = path.relative_to(model_path).as_posix()
-        digest.update(f"weight\0{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\0".encode())
-        with path.open("rb") as handle:
-            head = handle.read(sample_bytes)
-            digest.update(head)
-            if stat.st_size > sample_bytes:
-                handle.seek(max(0, stat.st_size - sample_bytes))
-                digest.update(handle.read(sample_bytes))
+        digest.update(f"weight\0{relative}\0{stat.st_size}\0".encode())
+        _update_file_content(digest, path)
     return digest.hexdigest()
 
 

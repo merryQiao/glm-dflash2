@@ -47,12 +47,32 @@ vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",position="0"} 9
         speculative = {
             "summary": {"completion_tokens": 200, "wall_seconds": 5.0, "tps": 40.0},
             "samples": [{"sample_id": "a", "output_text": "same"}],
-            "spec_decode": {"mean_acceptance_length": 6.0},
+            "spec_decode": {
+                "mean_acceptance_length": 6.0,
+                "draft_acceptance_rate": 5 / 7,
+                "drafts": 10.0,
+                "draft_tokens": 70.0,
+                "accepted_tokens": 50.0,
+            },
         }
         result = compare_benchmark_results(baseline, speculative, require_exact_outputs=True)
         self.assertEqual(result["speedup"], 2.0)
         self.assertTrue(result["exact_output_match"])
         self.assertEqual(result["mean_acceptance_length"], 6.0)
+
+    def test_comparison_rejects_speculative_run_without_active_draft_metrics(self):
+        baseline = {
+            "summary": {"tps": 20.0},
+            "samples": [{"sample_id": "a", "output_text": "same"}],
+        }
+        speculative = {
+            "summary": {"tps": 24.0},
+            "samples": [{"sample_id": "a", "output_text": "same"}],
+        }
+        with self.assertRaisesRegex(ValueError, "speculative run.*metrics"):
+            compare_benchmark_results(
+                baseline, speculative, require_exact_outputs=True
+            )
 
     def test_launcher_uses_sequential_baseline_and_spec_runs_and_rejects_dflash2(self):
         root = Path(__file__).resolve().parents[1]

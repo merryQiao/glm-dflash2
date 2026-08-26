@@ -50,7 +50,7 @@ from glm_dflash2.vibe_coding import (  # noqa: E402
 )
 from glm_dflash2.provenance import (  # noqa: E402
     dataset_fingerprint,
-    load_verified_endpoint_manifest,
+    load_endpoint_manifest_attestation,
     local_model_fingerprint,
 )
 from glm_dflash2.target_io import model_revision, tokenizer_fingerprint  # noqa: E402
@@ -610,7 +610,7 @@ def main() -> int:
                 "--allow-unverified-endpoint only for a small smoke run"
             )
         if args.endpoint_manifest is not None:
-            endpoint_identity = load_verified_endpoint_manifest(
+            endpoint_identity = load_endpoint_manifest_attestation(
                 args.endpoint_manifest,
                 expected_model_fingerprint=model_fingerprint,
                 expected_tokenizer_fingerprint=tokenizer_identity,
@@ -663,7 +663,14 @@ def main() -> int:
             "max_running_requests": args.max_running_requests,
             "max_total_tokens": args.max_total_tokens,
             "server_extra_args": list(args.server_extra_arg),
-            "weight_identity_verified": args.endpoint is None or endpoint_identity is not None,
+            "weight_identity_verified": args.endpoint is None,
+            "weight_identity_status": (
+                "local_full_content_hash"
+                if args.endpoint is None
+                else "operator_attested"
+                if endpoint_identity is not None
+                else "unverified_smoke_only"
+            ),
             "endpoint_identity": endpoint_identity,
         },
         "dataset": str(args.dataset.resolve()),
@@ -752,6 +759,7 @@ def main() -> int:
             )
             probe_client = OpenAIChatClient(chat_config)
             probe_client.assert_model_available()
+            probe_client.assert_token_id_capability()
             stack.callback(probe_client.session.close)
             completion_slots = threading.BoundedSemaphore(args.max_running_requests)
             chat_clients = ThreadLocalClientPool(

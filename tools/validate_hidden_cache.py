@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from glm_dflash2.hidden_cache import PackedHiddenDataset
+from glm_dflash2.parity_attestation import write_parity_attestation
 from glm_dflash2.target_io import load_frozen_target_io
 
 if __package__:
@@ -135,17 +136,30 @@ def main(argv: list[str] | None = None) -> int:
                     "aux_hidden_states": reference_hidden,
                     "target_final_hidden": reference_final,
                     "target_logits": torch.as_tensor(reference["target_logits"]),
+                    "input_ids": reference_ids,
+                    "layer_ids": torch.as_tensor(dataset.spec.layer_ids),
                 },
                 candidate={
                     "aux_hidden_states": row["layer_hidden_states"],
                     "target_final_hidden": row["target_final_hidden"],
                     "target_logits": candidate_logits,
+                    "input_ids": row["input_ids"],
+                    "layer_ids": torch.as_tensor(dataset.spec.layer_ids),
                 },
                 artifact=artifact,
                 identity=identity,
             )
             if not parity_result["passed"]:
                 raise ValueError(f"hidden capture parity gate failed: {parity_result}")
+            attestation_path = write_parity_attestation(
+                cache_dir=args.cache_dir,
+                target_io_dir=args.target_io_dir,
+                parity_gate=args.parity_gate,
+                runtime_identity=args.runtime_identity_json,
+                reference=args.reference_pt,
+                fixture=artifact["fixture"],
+                parity_result=parity_result,
+            )
             reference_status = "matched_parity_gate"
         else:
             for layer_index, layer_id in enumerate(dataset.spec.layer_ids):
@@ -185,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
                 "hidden_size": dataset.spec.hidden_size,
                 "reference": reference_status,
                 "parity": parity_result,
+                "attestation": str(attestation_path) if parity_result else None,
             }
         )
     )

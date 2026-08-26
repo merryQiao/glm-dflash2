@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,7 @@ import pyarrow.parquet as pq
 
 from glm_dflash2.provenance import (
     dataset_fingerprint,
-    load_verified_endpoint_manifest,
+    load_endpoint_manifest_attestation,
     local_model_fingerprint,
 )
 
@@ -31,7 +32,7 @@ class ProvenanceTest(unittest.TestCase):
                 },
             }
             path.write_text(json.dumps(value), encoding="utf-8")
-            loaded = load_verified_endpoint_manifest(
+            loaded = load_endpoint_manifest_attestation(
                 path,
                 expected_model_fingerprint="model-sha",
                 expected_tokenizer_fingerprint="tokenizer-sha",
@@ -39,11 +40,13 @@ class ProvenanceTest(unittest.TestCase):
             )
             self.assertEqual(loaded["manifest"], value)
             self.assertRegex(loaded["sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(loaded["weight_identity_status"], "operator_attested")
+            self.assertFalse(loaded["weight_identity_verified"])
 
             value["model_fingerprint"] = "other"
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "model fingerprint"):
-                load_verified_endpoint_manifest(
+                load_endpoint_manifest_attestation(
                     path,
                     expected_model_fingerprint="model-sha",
                     expected_tokenizer_fingerprint="tokenizer-sha",
@@ -67,7 +70,7 @@ class ProvenanceTest(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "runtime identity"):
-                load_verified_endpoint_manifest(
+                load_endpoint_manifest_attestation(
                     path,
                     expected_model_fingerprint="model-sha",
                     expected_tokenizer_fingerprint="tokenizer-sha",
@@ -83,6 +86,22 @@ class ProvenanceTest(unittest.TestCase):
             weight.write_bytes(b"first")
             first = local_model_fingerprint(root)
             weight.write_bytes(b"second-weight-version")
+            second = local_model_fingerprint(root)
+            self.assertNotEqual(first, second)
+
+    def test_model_fingerprint_hashes_weight_middle_not_only_metadata_and_edges(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config.json").write_text("{}")
+            (root / "tokenizer_config.json").write_text("{}")
+            weight = root / "model.safetensors"
+            weight.write_bytes(b"a" * (4 * 1024 * 1024))
+            stat = weight.stat()
+            first = local_model_fingerprint(root)
+            with weight.open("r+b") as handle:
+                handle.seek(2 * 1024 * 1024)
+                handle.write(b"changed-middle")
+            os.utime(weight, ns=(stat.st_atime_ns, stat.st_mtime_ns))
             second = local_model_fingerprint(root)
             self.assertNotEqual(first, second)
 

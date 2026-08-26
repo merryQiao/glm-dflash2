@@ -39,6 +39,17 @@ args=(
 
 if [[ -n "${ENDPOINT:-}" ]]; then
   args+=(--endpoint "$ENDPOINT")
+  if [[ -n "${ENDPOINT_MANIFEST:-}" ]]; then
+    args+=(--endpoint-manifest "$ENDPOINT_MANIFEST")
+  elif [[ "${ALLOW_UNVERIFIED_ENDPOINT:-0}" == 1 ]]; then
+    args+=(--allow-unverified-endpoint)
+  else
+    echo "external ENDPOINT requires ENDPOINT_MANIFEST (unverified is smoke-only)" >&2
+    exit 2
+  fi
+elif [[ -n "${ENDPOINT_MANIFEST:-}" ]]; then
+  echo "ENDPOINT_MANIFEST requires ENDPOINT" >&2
+  exit 2
 fi
 if [[ -n "${QUANTIZATION:-}" ]]; then
   args+=(--quantization "$QUANTIZATION")

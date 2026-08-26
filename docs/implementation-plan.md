@@ -15,14 +15,16 @@ Implemented modules:
 - `sglang_hidden_runner.py` and `tools/extract_hidden_sglang.py`: selected-layer
   SGLang internal teacher-forced pass;
 - `hidden_cache.py`: packed durable cache and DFlash training reader;
-- `tools/validate_hidden_cache.py`: integrity/shape/finite validation.
+- `tools/validate_hidden_cache.py`: integrity/shape/finite/parity validation and
+  immutable training attestation.
 - `target_io.py`: selective frozen embedding/LM-head extraction and provenance;
 - `dflash2_blocks.py`, `dflash2_objective.py`: exact anchors, masks and losses;
 - `chunked_lm_head.py`: exact two-axis chunked full-vocabulary projection;
 - `dflash2_model.py`: portable five-layer draft, dynamic conv and selector;
 - `offline_trainer.py`: cache-to-loss training forward with unregistered I/O;
 - `distributed.py`, `checkpointing.py`: HCCL/FSDP2 accumulation and exact resume;
-- `tools/train_dflash2_offline.py`: offline training entrypoint and draft export.
+- `tools/train_drafter_offline.py`: the single DFlash/DFlash2/DSpark training
+  entrypoint and method-aware draft export.
 
 Remaining hardware gates are a real GLM-5.2 layer-capture identity check, a
 two-rank 910B optimizer/save/resume run, and tensor-by-tensor parity with the

@@ -1,4 +1,7 @@
 # Runtime baseline: quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16.
+# Before Stage A, install patches/sglang-v0.5.16-chat-token-ids.patch with
+# scripts/apply_sglang_v0516_token_ids_patch.sh. The unpatched image does not
+# return the exact sampled response token IDs required by offline training.
 # Its bundled CANN 9.0 / PyTorch / torch-npu tuple is one indivisible vendor
 # stack. Do not install a generic PyPI torch wheel over it: that breaks HCCL.
 transformers==4.57.3

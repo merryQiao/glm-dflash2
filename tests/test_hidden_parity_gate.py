@@ -12,6 +12,7 @@ from unittest import mock
 import torch
 
 from glm_dflash2.hidden_cache import HiddenCacheSpec, PackedHiddenWriter
+from glm_dflash2.parity_attestation import validate_training_parity_attestation
 from tools.calibrate_hidden_capture_gate import (
     calibrate_parity_gate,
     capture_error_metrics,
@@ -30,6 +31,8 @@ class HiddenParityGateTest(unittest.TestCase):
             "target_logits": torch.tensor(
                 [[0.2, 1.3, -0.4], [2.0, -1.0, 0.3]]
             ),
+            "input_ids": torch.tensor([101, 102]),
+            "layer_ids": torch.tensor([1, 20]),
         }
         self.identity = {
             "target_fingerprint": "glm52-bf16-sha",
@@ -41,13 +44,57 @@ class HiddenParityGateTest(unittest.TestCase):
         }
 
     def _offset(self, amount: float):
-        return {key: value + amount for key, value in self.reference.items()}
+        return {
+            **{
+                key: self.reference[key] + amount
+                for key in (
+                    "aux_hidden_states",
+                    "target_final_hidden",
+                    "target_logits",
+                )
+            },
+            "input_ids": self.reference["input_ids"].clone(),
+            "layer_ids": self.reference["layer_ids"].clone(),
+        }
+
+    def test_calibration_binds_identical_fixture_tokens_and_logical_layers(self):
+        direct = [self.reference, self._offset(0.001), self._offset(-0.002)]
+        controls = {
+            "shifted_layer": self._offset(0.5),
+            "pre_norm": self._offset(-0.4),
+        }
+        artifact = calibrate_parity_gate(
+            direct_runs=direct,
+            negative_controls=controls,
+            floors={
+                "cosine_error": 1e-8,
+                "max_abs_error": 1e-4,
+                "mean_abs_error": 1e-4,
+            },
+            identity=self.identity,
+        )
+        self.assertEqual(artifact["fixture"]["layer_ids"], [1, 20])
+        self.assertEqual(artifact["fixture"]["tokens"], 2)
+        self.assertRegex(artifact["fixture"]["input_ids_sha256"], r"^[0-9a-f]{64}$")
+        direct[1] = dict(direct[1], input_ids=torch.tensor([101, 999]))
+        with self.assertRaisesRegex(ValueError, "fixture input_ids"):
+            calibrate_parity_gate(
+                direct_runs=direct,
+                negative_controls=controls,
+                floors={
+                    "cosine_error": 1e-8,
+                    "max_abs_error": 1e-4,
+                    "mean_abs_error": 1e-4,
+                },
+                identity=self.identity,
+            )
 
     def test_error_metrics_use_one_minus_cosine_and_absolute_errors(self):
         candidate = self._offset(0.01)
         metrics = capture_error_metrics(self.reference, candidate)
-        left = torch.cat([value.float().reshape(-1) for value in self.reference.values()])
-        right = torch.cat([value.float().reshape(-1) for value in candidate.values()])
+        keys = ("aux_hidden_states", "target_final_hidden", "target_logits")
+        left = torch.cat([self.reference[key].float().reshape(-1) for key in keys])
+        right = torch.cat([candidate[key].float().reshape(-1) for key in keys])
         expected_cosine = 1.0 - torch.nn.functional.cosine_similarity(
             left[None], right[None]
         ).item()
@@ -214,14 +261,36 @@ class HiddenParityGateTest(unittest.TestCase):
                 "target_logits": torch.tensor(
                     [[1.0, 2.0, -1.0], [3.0, 4.0, -2.0]]
                 ),
+                "input_ids": torch.tensor([1, 2]),
+                "layer_ids": torch.tensor([1, 20, 38, 56, 75]),
             }
             artifact = calibrate_parity_gate(
                 direct_runs=[capture, capture, capture],
                 negative_controls={
                     "shifted_layer": {
-                        key: value + 0.5 for key, value in capture.items()
+                        **{
+                            key: capture[key] + 0.5
+                            for key in (
+                                "aux_hidden_states",
+                                "target_final_hidden",
+                                "target_logits",
+                            )
+                        },
+                        "input_ids": capture["input_ids"],
+                        "layer_ids": capture["layer_ids"],
                     },
-                    "pre_norm": {key: value - 0.4 for key, value in capture.items()},
+                    "pre_norm": {
+                        **{
+                            key: capture[key] - 0.4
+                            for key in (
+                                "aux_hidden_states",
+                                "target_final_hidden",
+                                "target_logits",
+                            )
+                        },
+                        "input_ids": capture["input_ids"],
+                        "layer_ids": capture["layer_ids"],
+                    },
                 },
                 floors={
                     "cosine_error": 1e-9,
@@ -234,6 +303,13 @@ class HiddenParityGateTest(unittest.TestCase):
             identity_path = root / "identity.json"
             artifact_path.write_text(json.dumps(artifact))
             identity_path.write_text(json.dumps(self.identity))
+            target_io_dir = root / "target-io"
+            target_io_dir.mkdir()
+            weights = target_io_dir / "model.safetensors"
+            weights.write_bytes(b"target-io")
+            (target_io_dir / "manifest.json").write_text(
+                json.dumps({"weights_file": weights.name})
+            )
             output = StringIO()
             head = torch.nn.Linear(2, 3, bias=False)
             with torch.no_grad():
@@ -250,13 +326,44 @@ class HiddenParityGateTest(unittest.TestCase):
                         "--reference-pt", str(reference),
                         "--parity-gate", str(artifact_path),
                         "--runtime-identity-json", str(identity_path),
-                        "--target-io-dir", str(root / "target-io"),
+                        "--target-io-dir", str(target_io_dir),
                     ]
                 )
             self.assertEqual(status, 0)
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["reference"], "matched_parity_gate")
             self.assertTrue(payload["parity"]["passed"])
+            attestation = validate_training_parity_attestation(cache, target_io_dir)
+            self.assertTrue(attestation["passed"])
+            weights.write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "target I/O"):
+                validate_training_parity_attestation(cache, target_io_dir)
+
+    def test_training_rejects_a_frozen_cache_without_parity_attestation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            with PackedHiddenWriter(
+                cache,
+                spec=HiddenCacheSpec(
+                    layer_ids=(1,),
+                    hidden_size=2,
+                    capture_mapping=(("test", 1, "tap", "post_decoder_block"),),
+                ),
+            ) as writer:
+                writer.append(
+                    sample_id="missing-attestation",
+                    source_index=0,
+                    input_ids=[1],
+                    loss_mask=[1],
+                    aux_hidden_states=torch.ones(1, 1, 2),
+                    target_final_hidden=torch.ones(1, 2),
+                )
+                writer.freeze()
+            target_io = root / "target-io"
+            target_io.mkdir()
+            with self.assertRaisesRegex(ValueError, "parity attestation"):
+                validate_training_parity_attestation(cache, target_io)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,11 @@ from unittest.mock import Mock
 
 from tools.generate_trajectories import _existing_ids
 
-from glm_dflash2.agent_trajectory import ChatCompletionConfig, OpenAIChatClient
+from glm_dflash2.agent_trajectory import (
+    ChatCompletionConfig,
+    OpenAIChatClient,
+    TrajectoryError,
+)
 from glm_dflash2.sglang_stage_a import (
     AttemptErrorLedger,
     CommittedJsonlWriter,
@@ -94,6 +98,71 @@ class SGLangStageATest(unittest.TestCase):
         self.assertTrue(payload["return_token_ids"])
         self.assertEqual(value["_response_metadata"]["prompt_token_ids"], [1, 2])
         self.assertEqual(value["_response_metadata"]["response_token_ids"], [3, 4])
+
+    def test_token_id_capability_probe_fails_before_rollout_when_server_omits_ids(self):
+        client = OpenAIChatClient(
+            ChatCompletionConfig(
+                endpoint="http://localhost:30000",
+                model="GLM-5.2",
+                reasoning_effort=None,
+                return_token_ids=True,
+            )
+        )
+        response = Mock()
+        response.ok = True
+        response.json.return_value = {
+            "id": "probe",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"},
+            }],
+        }
+        client.session.post = Mock(return_value=response)
+        with self.assertRaisesRegex(TrajectoryError, "SGLang.*token-ID.*patch"):
+            client.assert_token_id_capability()
+        payload = client.session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["max_tokens"], 1)
+        self.assertEqual(payload["temperature"], 0.0)
+        self.assertTrue(payload["return_token_ids"])
+
+    def test_token_id_capability_probe_explains_unpatched_request_rejection(self):
+        client = OpenAIChatClient(
+            ChatCompletionConfig(
+                endpoint="http://localhost:30000",
+                model="GLM-5.2",
+                reasoning_effort=None,
+                return_token_ids=True,
+            )
+        )
+        response = Mock(ok=False, status_code=422, text="unknown return_token_ids")
+        client.session.post = Mock(return_value=response)
+        with self.assertRaisesRegex(TrajectoryError, "compatibility patch"):
+            client.assert_token_id_capability()
+
+    def test_pinned_sglang_patch_contains_the_exact_nonstream_token_id_contract(self):
+        root = Path(__file__).resolve().parents[1]
+        patch = (root / "patches/sglang-v0.5.16-chat-token-ids.patch").read_text()
+        for required in (
+            "+    return_token_ids: bool = False",
+            "+    response_token_ids: Optional[List[int]] = None",
+            "+                ret_item[\"output_ids\"] if request.return_token_ids else None",
+            "+                response_token_ids=choice_response_token_ids,",
+        ):
+            self.assertIn(required, patch)
+
+    def test_patch_installer_refuses_unpinned_sglang_and_dry_runs_first(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts/apply_sglang_v0516_token_ids_patch.sh").read_text()
+        self.assertIn('"$version" != "0.5.16"', script)
+        self.assertIn("patch --dry-run", script)
+        self.assertIn("SGLANG_ROOT", script)
+
+    def test_stage_a_launcher_forwards_external_endpoint_attestation(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "scripts/run_stage_a_trajectories.sh").read_text()
+        self.assertIn("ENDPOINT_MANIFEST", script)
+        self.assertIn("--endpoint-manifest", script)
+        self.assertIn("ALLOW_UNVERIFIED_ENDPOINT", script)
 
     def test_modulo_sharding_uses_global_source_index(self):
         self.assertTrue(owns_source_index(7, shard_index=1, shard_count=3))

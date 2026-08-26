@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -22,6 +23,7 @@ IDENTITY_KEYS = (
     "torch_npu_version",
     "sglang_version",
 )
+FIXTURE_KEYS = ("input_ids", "layer_ids")
 
 
 def _capture_vector(capture: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -108,6 +110,38 @@ def _validated_identity(identity: Mapping[str, Any]) -> dict[str, str]:
     return value
 
 
+def _fixture_identity(captures: Sequence[Mapping[str, torch.Tensor]]) -> dict[str, Any]:
+    if not captures:
+        raise ValueError("capture fixture set is empty")
+    identities = []
+    for capture in captures:
+        missing = [key for key in FIXTURE_KEYS if key not in capture]
+        if missing:
+            raise ValueError(f"capture is missing fixture {', '.join(missing)}")
+        input_ids = torch.as_tensor(capture["input_ids"], dtype=torch.int64).reshape(-1)
+        layer_ids = torch.as_tensor(capture["layer_ids"], dtype=torch.int64).reshape(-1)
+        aux = torch.as_tensor(capture["aux_hidden_states"])
+        final = torch.as_tensor(capture["target_final_hidden"])
+        logits = torch.as_tensor(capture["target_logits"])
+        if aux.ndim < 2 or aux.shape[0] != input_ids.numel():
+            raise ValueError("fixture input_ids do not align with aux_hidden_states")
+        if final.shape[0] != input_ids.numel() or logits.shape[0] != input_ids.numel():
+            raise ValueError("fixture input_ids do not align with final hidden/logits")
+        if aux.shape[-2] != layer_ids.numel():
+            raise ValueError("fixture layer_ids do not align with auxiliary layer axis")
+        raw = input_ids.contiguous().numpy().astype("<i8", copy=False).tobytes()
+        identities.append(
+            {
+                "input_ids_sha256": hashlib.sha256(raw).hexdigest(),
+                "tokens": int(input_ids.numel()),
+                "layer_ids": [int(value) for value in layer_ids.tolist()],
+            }
+        )
+    if any(value != identities[0] for value in identities[1:]):
+        raise ValueError("parity captures use different fixture input_ids or layer_ids")
+    return identities[0]
+
+
 def calibrate_parity_gate(
     *,
     direct_runs: Sequence[Mapping[str, torch.Tensor]],
@@ -121,6 +155,8 @@ def calibrate_parity_gate(
         raise ValueError("negative controls must be shifted_layer and pre_norm")
     if set(floors) != set(METRIC_KEYS) or any(float(value) < 0 for value in floors.values()):
         raise ValueError("every parity metric needs a non-negative explicit floor")
+
+    fixture = _fixture_identity([*direct_runs, *negative_controls.values()])
 
     direct_metrics = []
     for left_index in range(len(direct_runs)):
@@ -160,6 +196,7 @@ def calibrate_parity_gate(
         "schema": "glm-hidden-capture-parity-gate-v2",
         "calibration_runs": 3,
         "identity": _validated_identity(identity),
+        "fixture": fixture,
         "capture_keys": list(CAPTURE_KEYS),
         "streams": streams,
         "target_top1_required": True,
@@ -178,6 +215,9 @@ def validate_capture_with_gate(
     expected_identity = _validated_identity(identity)
     if artifact.get("identity") != expected_identity:
         raise ValueError("parity gate identity differs from the active runtime identity")
+    fixture = _fixture_identity([reference, candidate])
+    if artifact.get("fixture") != fixture:
+        raise ValueError("parity gate fixture differs from capture input_ids/layer_ids")
     actual = capture_stream_error_metrics(reference, candidate)
     stream_results = {}
     passed = True
@@ -223,7 +263,8 @@ def _load_capture(path: str | Path) -> dict[str, torch.Tensor]:
     value = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(value, Mapping):
         raise ValueError(f"capture {path} is not a mapping")
-    return {key: torch.as_tensor(value[key]) for key in CAPTURE_KEYS if key in value}
+    keys = (*CAPTURE_KEYS, *FIXTURE_KEYS)
+    return {key: torch.as_tensor(value[key]) for key in keys if key in value}
 
 
 def build_parser() -> argparse.ArgumentParser:

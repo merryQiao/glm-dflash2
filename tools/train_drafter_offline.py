@@ -46,11 +46,18 @@ from glm_dflash2.offline_trainer import (
     OfflineDFlashTrainer,
     OfflineDSparkTrainer,
 )
+from glm_dflash2.parity_attestation import validate_training_parity_attestation
 from glm_dflash2.speculator_export import export_speculator
 from glm_dflash2.target_io import load_frozen_target_io
 
 
 METHODS = ("dflash", "dflash2", "dspark")
+
+
+def _training_preflight(cache_dir: str, target_io_dir: str) -> dict[str, Any]:
+    manifest = validate_frozen_hidden_cache(cache_dir)
+    validate_training_parity_attestation(cache_dir, target_io_dir)
+    return manifest
 
 
 def build_parser(*, default_method: str | None = None) -> argparse.ArgumentParser:
@@ -316,10 +323,16 @@ def _ratios(method: str, reduced: dict[str, torch.Tensor]) -> dict[str, float]:
     base = ratio("base_numerator", "base_denominator")
     selector = ratio("selector_numerator", "selector_denominator")
     selector_weight = 1.0 if method == "dflash2" else 0.0
+    total_numerator = float(reduced["base_numerator"].item()) + selector_weight * float(
+        reduced["selector_numerator"].item()
+    )
+    base_denominator = float(reduced["base_denominator"].item())
+    total = total_numerator / base_denominator if base_denominator > 0 else 0.0
     return {
-        "loss": base + selector_weight * selector,
+        "loss": total,
         "base_loss": base,
         "selector_loss": selector,
+        "selector_loss_on_hits": selector,
         "base_accuracy": ratio("base_correct", "valid_tokens"),
         "selector_accuracy": ratio("selector_correct", "valid_tokens"),
         "base_accept": ratio("base_accept_total", "valid_blocks"),
@@ -373,7 +386,7 @@ def main(argv: list[str] | None = None, *, default_method: str | None = None) ->
         # tensors.  Only rank 0 performs shared-storage I/O; the result is
         # broadcast so no worker can continue with a corrupt cache.
         run_rank0_preflight(
-            lambda: validate_frozen_hidden_cache(args.cache_dir),
+            lambda: _training_preflight(args.cache_dir, args.target_io_dir),
             is_main=context.is_main,
         )
         dataset = PackedHiddenDataset(args.cache_dir, require_frozen=True)

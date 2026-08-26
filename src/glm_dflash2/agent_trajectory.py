@@ -16,7 +16,7 @@ import re
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -238,6 +238,41 @@ class OpenAIChatClient:
         if self.config.model not in models:
             raise TrajectoryError(
                 f"requested model {self.config.model!r} is not exposed by server: {models}"
+            )
+
+    def assert_token_id_capability(self) -> None:
+        """Fail before rollout unless chat returns the exact sampled token path."""
+
+        if not self.config.return_token_ids:
+            raise TrajectoryError("token-ID capability probe requires return_token_ids=true")
+        original = self.config
+        self.config = replace(
+            original,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            max_tokens=1,
+            reasoning_effort=None,
+        )
+        try:
+            try:
+                response = self.complete(
+                    [{"role": "user", "content": "Reply with one token."}], []
+                )
+            except TrajectoryError as exc:
+                raise TrajectoryError(
+                    "SGLang chat token-ID capability probe failed; apply the included "
+                    f"v0.5.16 compatibility patch ({exc})"
+                ) from exc
+        finally:
+            self.config = original
+        metadata = response.get("_response_metadata") or {}
+        prompt_ids = metadata.get("prompt_token_ids")
+        response_ids = metadata.get("response_token_ids")
+        if not isinstance(prompt_ids, list) or not isinstance(response_ids, list):
+            raise TrajectoryError(
+                "SGLang chat token-ID capability is unavailable; apply the included "
+                "v0.5.16 compatibility patch before generating trajectories"
             )
 
     def complete(

@@ -1,0 +1,75 @@
+diff --git a/python/sglang/srt/entrypoints/openai/protocol.py b/python/sglang/srt/entrypoints/openai/protocol.py
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -746,6 +746,7 @@ class ChatCompletionRequest(BaseModel):
+     routed_experts_start_len: int = 0
+     return_cached_tokens_details: bool = False
+     return_prompt_token_ids: bool = False
++    return_token_ids: bool = False
+     return_meta_info: bool = False
+     reasoning_effort: ReasoningEffortType = Field(
+         default=None,
+@@ -1056,5 +1057,6 @@ class ChatCompletionResponseChoice(BaseModel):
+     hidden_states: Optional[object] = None
+     prompt_token_ids: Optional[List[int]] = None
++    response_token_ids: Optional[List[int]] = None
+     meta_info: Optional[Dict[str, Any]] = None
+ 
+     @model_serializer(mode="wrap")
+@@ -1066,6 +1068,8 @@ class ChatCompletionResponseChoice(BaseModel):
+             data.pop("hidden_states", None)
+         if self.prompt_token_ids is None:
+             data.pop("prompt_token_ids", None)
++        if self.response_token_ids is None:
++            data.pop("response_token_ids", None)
+         if self.meta_info is None:
+             data.pop("meta_info", None)
+         return data
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -682,6 +682,12 @@ class OpenAIServingChat(OpenAIServingBase):
+                     "return_prompt_token_ids is not supported with streaming. "
+                     "Please set stream=false when using return_prompt_token_ids=true."
+                 )
++            if request.return_token_ids:
++                raise ValueError(
++                    "return_token_ids is not supported with streaming on "
++                    "/v1/chat/completions. Please set stream=false when using "
++                    "return_token_ids=true."
++                )
+             if request.return_meta_info:
+                 raise ValueError(
+                     "return_meta_info is not supported with streaming. "
+@@ -771,7 +777,8 @@ class OpenAIServingChat(OpenAIServingBase):
+             video_max_dynamic_patch=vid_max_dynamic_patch,
+             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+             use_audio_in_video=getattr(request, "use_audio_in_video", False),
+-            return_prompt_token_ids=request.return_prompt_token_ids,
++            return_prompt_token_ids=request.return_prompt_token_ids
++            or request.return_token_ids,
+         )
+ 
+         return adapted_request, request
+@@ -1539,9 +1546,12 @@ class OpenAIServingChat(OpenAIServingBase):
+             # Extract prompt_token_ids if requested
+             choice_prompt_token_ids = (
+                 ret_item.get("prompt_token_ids")
+-                if request.return_prompt_token_ids
++                if request.return_prompt_token_ids or request.return_token_ids
+                 else None
+             )
++            choice_response_token_ids = (
++                ret_item["output_ids"] if request.return_token_ids else None
++            )
+ 
+             choice_meta_info = (
+                 ret_item["meta_info"] if request.return_meta_info else None
+@@ -1568,6 +1578,7 @@ class OpenAIServingChat(OpenAIServingBase):
+                 ),
+                 hidden_states=hidden_states,
+                 prompt_token_ids=choice_prompt_token_ids,
++                response_token_ids=choice_response_token_ids,
+                 meta_info=choice_meta_info,
+             )
+             choices.append(choice_data)

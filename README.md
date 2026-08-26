@@ -115,6 +115,7 @@ cd /path/to/glm-dflash2
 
 MODEL_PATH=/shared/models/GLM-5.2 \
 ENDPOINT=http://glm52-sglang-service:30000 \
+ENDPOINT_MANIFEST=/shared/identity/glm52-endpoint.json \
 SERVED_MODEL_NAME=GLM-5.2 \
 WORKSPACE_MAP=/shared/data/workspace_map.jsonl \
 WORKSPACE_CACHE=/shared/cache/vibe-workspaces \
@@ -149,8 +150,9 @@ retry cannot produce duplicate committed IDs.
 `MODEL_PATH` is still required locally for the exact tokenizer/chat template.
 An external OpenAI endpoint exposes its served model name but not a weight
 digest, so the manifest records `weight_identity_verified=false`. Operational
-deployment must bind that endpoint to the same immutable model revision as
-`MODEL_PATH`; a local temporary server is fingerprint-verifiable.
+deployment records its JSON as `weight_identity_status=operator_attested`; that
+claim is checked for consistency with `MODEL_PATH` but is not misreported as a
+server-proved weight digest. A local temporary server is fingerprint-verifiable.
 Repository-backed rows without a materialized workspace are hard errors; they
 are never silently converted into invented tool traces.
 
@@ -161,6 +163,17 @@ detokenized text is never silently re-tokenized and accepted as the sampled
 path. Restored Open-SWE source trajectories are a separate, explicitly marked
 `teacher_forced_original_trajectory` route because their original server token
 metadata is not available.
+
+The pinned `quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16` image predates that
+non-streaming chat response field. Patch that exact image once before starting
+the server (the installer refuses every other SGLang version and dry-runs first):
+
+```bash
+PY=/path/to/vendor/python bash scripts/apply_sglang_v0516_token_ids_patch.sh
+```
+
+Stage A also sends a one-token capability probe before opening any workspace or
+committing a sample, so an unpatched/incompatible endpoint fails immediately.
 
 The Stage A route behavior follows the specified SpecForge
 `vibe_coding_qwen38.py` pipeline:
@@ -305,8 +318,16 @@ python tools/validate_hidden_cache.py \
   --cache-dir /shared/gate/hidden-v2 \
   --reference-pt direct-1.pt \
   --parity-gate hidden-parity-gate.json \
-  --runtime-identity-json runtime-identity.json
+  --runtime-identity-json runtime-identity.json \
+  --target-io-dir /shared/out/glm52-target-io
 ```
+
+All five calibration files must contain the identical `input_ids` and
+`layer_ids` in addition to the three compared tensor streams. A successful
+validation writes `parity_attestation.json` into the frozen cache, binding the
+cache manifest/index, target I/O, gate, runtime identity and direct reference.
+Every production training entrypoint requires and revalidates that attestation;
+there is no command-line bypass.
 
 ## Explicit limits
 

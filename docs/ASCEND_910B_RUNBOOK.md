@@ -19,6 +19,7 @@ A service, stop it, then start Stage B; do not keep duplicate target replicas.
 ```bash
 MODEL_PATH=/shared/models/GLM-5.2-bf16 \
 ENDPOINT=http://glm52-sglang-service:30000 \
+ENDPOINT_MANIFEST=/shared/identity/glm52-endpoint.json \
 SERVED_MODEL_NAME=GLM-5.2 \
 WORKSPACE_MAP=/shared/data/workspace_map.jsonl \
 WORKSPACE_CACHE=/shared/cache/vibe-workspaces \
@@ -26,6 +27,12 @@ OPEN_SWE_STORE=/shared/data/open_swe_original.sqlite \
 OUTPUT_JSONL=/shared/out/trajectories-shard-0.jsonl \
 bash scripts/run_stage_a_trajectories.sh
 ```
+
+For the pinned SGLang 0.5.16 image, first run
+`scripts/apply_sglang_v0516_token_ids_patch.sh` inside the image and restart the
+service. Stage A's one-token capability probe must return both prompt and
+sampled response IDs before any real episode starts. The endpoint manifest is
+an operator attestation, not cryptographic proof of the remote weight bytes.
 
 Require a frozen manifest, zero unresolved errors, stable IDs and the intended
 sampling parameters. A `MAX_SAMPLES` output is intentionally partial and may
@@ -48,34 +55,7 @@ Expected logical taps are `[1,20,38,56,75]`; the cache must contain both
 `aux_hidden_states.bin` and `target_final_hidden.bin`. Each sample is captured
 with one teacher-forced target forward.
 
-## 4. Calibrate and enforce numerical parity
-
-On one short fixed token sequence, save:
-
-1. three repeated direct-forward captures;
-2. one deliberately shifted-layer capture;
-3. one deliberately pre-final-norm capture.
-
-Each `.pt` contains `aux_hidden_states`, `target_final_hidden`, `input_ids` and
-`layer_ids`. Run `tools/calibrate_hidden_capture_gate.py` with all six identity
-fields. Keep the emitted JSON under experiment control; production validation
-must not regenerate it.
-
-Then run:
-
-```bash
-python tools/validate_hidden_cache.py \
-  --cache-dir /shared/gate/hidden-v2 \
-  --allow-building-cache \
-  --reference-pt /shared/gate/direct-1.pt \
-  --parity-gate /shared/gate/hidden-parity-gate.json \
-  --runtime-identity-json /shared/gate/runtime-identity.json
-```
-
-Proceed only when cosine, max-absolute and mean-absolute errors pass and both
-negative controls remain outside the calibrated bounds.
-
-## 5. Extract frozen token I/O
+## 4. Extract token I/O, then calibrate and enforce numerical parity
 
 ```bash
 MODEL_PATH=/shared/models/GLM-5.2-bf16 \
@@ -86,7 +66,35 @@ bash scripts/extract_glm52_io.sh
 The artifact must declare identity logits, no bias/scaling/softcap, BF16 source
 dtypes and matching model/tokenizer fingerprints.
 
-## 6. Run local and two-rank training gates
+On one short fixed token sequence, save:
+
+1. three repeated direct-forward captures;
+2. one deliberately shifted-layer capture;
+3. one deliberately pre-final-norm capture.
+
+Each `.pt` contains `aux_hidden_states`, `target_final_hidden`, `target_logits`,
+`input_ids` and `layer_ids`; all five files use exactly the same fixture IDs.
+Run `tools/calibrate_hidden_capture_gate.py` with all six identity
+fields. Keep the emitted JSON under experiment control; production validation
+must not regenerate it.
+
+Then run:
+
+```bash
+python tools/validate_hidden_cache.py \
+  --cache-dir /shared/gate/hidden-v2 \
+  --reference-pt /shared/gate/direct-1.pt \
+  --parity-gate /shared/gate/hidden-parity-gate.json \
+  --runtime-identity-json /shared/gate/runtime-identity.json \
+  --target-io-dir /shared/out/glm52-target-io
+```
+
+Proceed only when cosine, max-absolute and mean-absolute errors pass and both
+negative controls remain outside the calibrated bounds. This writes the fixed
+`hidden-v2/parity_attestation.json`; training refuses a cache without it and
+recomputes its cache and target-I/O bindings before allocating the drafter.
+
+## 5. Run local and two-rank training gates
 
 ```bash
 PY=/path/to/vendor/python bash scripts/smoke_no_model.sh
@@ -101,7 +109,7 @@ bash scripts/gate_train_2rank_910b.sh
 Require finite loss/gradients, unchanged frozen target I/O, complete checkpoint
 markers and exact uninterrupted-vs-resume output parity.
 
-## 7. Train one method
+## 6. Train one method
 
 ```bash
 METHOD=dspark \
@@ -125,7 +133,7 @@ For multiple nodes, use identical
 arguments and set `NODE_RANK` uniquely. Resume only from a `COMPLETE` step and
 do not change cache identity, method, architecture, optimizer or scheduler.
 
-## 8. Export and serving ABI gate
+## 7. Export and serving ABI gate
 
 Training writes `OUTPUT_DIR/export`. Unlike the resumable training checkpoint,
 this deployment artifact contains the trained draft plus frozen target
@@ -145,7 +153,7 @@ DFlash and DSpark use the public Speculators config/key contract. DFlash2 is
 marked `custom-vllm-ascend-adapter-required`; do not bypass that preflight or
 mislabel it as stock DFlash.
 
-## 9. Acceptance and TPS benchmark
+## 8. Acceptance and TPS benchmark
 
 Use the same NPU set sequentially, never two co-resident target replicas:
 

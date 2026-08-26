@@ -8,6 +8,7 @@ from glm_dflash2.dflash2_model import Qwen3DFlash2DraftModel, build_dflash2_conf
 from glm_dflash2.draft_backbone import DFlashDraftModel
 from glm_dflash2.dspark_model import DSparkDraftModel
 from tools.train_drafter_offline import (
+    _ratios,
     _sample_or_dummy_anchors,
     build_method_model,
     build_parser,
@@ -111,6 +112,25 @@ class UnifiedTrainCliTest(unittest.TestCase):
         anchors, keep, local_has = _sample_or_dummy_anchors(batch, Trainer(), epoch=0)
         self.assertTrue(local_has)
         self.assertEqual(tuple(anchors.shape), tuple(keep.shape))
+
+    def test_dflash2_logged_total_uses_the_backward_common_denominator(self):
+        reduced = {
+            "base_numerator": torch.tensor(8.0),
+            "base_denominator": torch.tensor(4.0),
+            "selector_numerator": torch.tensor(2.0),
+            "selector_denominator": torch.tensor(1.0),
+            "base_correct": torch.tensor(2.0),
+            "selector_correct": torch.tensor(1.0),
+            "valid_tokens": torch.tensor(4.0),
+            "base_accept_total": torch.tensor(5.0),
+            "selector_accept_total": torch.tensor(6.0),
+            "valid_blocks": torch.tensor(1.0),
+            "candidate_hits": torch.tensor(1.0),
+            "candidate_total": torch.tensor(4.0),
+        }
+        metrics = _ratios("dflash2", reduced)
+        self.assertEqual(metrics["loss"], (8.0 + 2.0) / 4.0)
+        self.assertEqual(metrics["selector_loss_on_hits"], 2.0)
 
 
 if __name__ == "__main__":
