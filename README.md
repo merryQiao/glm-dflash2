@@ -73,7 +73,7 @@ about 46.4 TB, so storage planning is mandatory.
 - **DFlash2:** the same backbone plus identity-initialized two-tap grouped
   dynamic convolution and a rank-256/top-16 candidate selector. It uses base CE
   plus selector CE when the target occurs in base top-16.
-- **DSpark:** the plain common backbone plus the official rank-256 vanilla
+- **DSpark:** the plain common backbone plus a rank-256 vanilla
   Markov head `Embedding(V,256) -> Linear(256,V)` and a Markov-aware confidence
   head. Target distributions are reconstructed from
   `target_final_hidden @ frozen_lm_head.T`; its exact chunked loss is
@@ -84,8 +84,8 @@ depth zero the predecessor is the clean anchor; later depths use the
 teacher-forced previous target. The LM-head matmul stays BF16 and logits/loss
 normalization use FP32.
 
-The DSpark confidence soft target is `1 - 0.5 * full_vocab_L1`; its default
-GLM-5.2 five-layer preview recipe is three epochs, learning rate `6e-4`, gamma 4, and loss
+The DSpark confidence soft target is `1 - 0.5 * full_vocab_L1`; the unified
+GLM-5.2 five-layer recipe is three epochs, learning rate `6e-4`, gamma 4, and loss
 `0.1*CE + 0.9*L1 + 1.0*confidence_BCE`. DFlash/DFlash2 retain three epochs
 and learning rate `6e-4`; gamma is 4 for B8 and 7 for B16.
 

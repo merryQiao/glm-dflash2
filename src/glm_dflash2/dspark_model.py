@@ -8,7 +8,7 @@ from .draft_backbone import DFlashDraftModel
 
 
 class LowRankMarkovHead(nn.Module):
-    """Official DSpark vanilla predecessor-token low-rank vocabulary bias."""
+    """Vanilla predecessor-token low-rank vocabulary bias used by DSpark."""
 
     def __init__(
         self,

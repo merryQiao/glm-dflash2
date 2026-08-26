@@ -68,7 +68,7 @@ class DSparkModelTest(unittest.TestCase):
         self.assertAlmostEqual(low.item(), 0.0)
         self.assertAlmostEqual(high.item(), 2.0)
 
-    def test_official_head_initialization_uses_model_initializer_range(self):
+    def test_head_initialization_uses_model_initializer_range(self):
         torch.manual_seed(123)
         head = LowRankMarkovHead(vocab_size=4096, hidden_size=8, rank=64)
         self.assertAlmostEqual(head.markov_w1.weight.std().item(), 0.02, delta=0.001)
