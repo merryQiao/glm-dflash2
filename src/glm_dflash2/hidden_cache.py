@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .hidden_capture import FINAL_HIDDEN_SEMANTICS
 from .jsonl import repair_truncated_jsonl
 
 
@@ -40,6 +41,9 @@ def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+CaptureMappingTuple = tuple[str, int, str, str]
+
+
 @dataclass(frozen=True)
 class HiddenCacheSpec:
     layer_ids: tuple[int, ...]
@@ -47,21 +51,170 @@ class HiddenCacheSpec:
     dtype: str = "bfloat16"
     input_dtype: str = "int64"
     mask_semantics: str = "dflash_target_token"
-    schema_version: int = 1
+    schema_version: int = 2
+    capture_mapping: tuple[CaptureMappingTuple, ...] = ()
+    target_num_hidden_layers: int = 78
+    final_hidden_size: int | None = None
+    final_hidden_dtype: str = "bfloat16"
+    final_hidden_semantics: str = FINAL_HIDDEN_SEMANTICS
 
     def __post_init__(self) -> None:
         if not self.layer_ids or any(layer < 0 for layer in self.layer_ids):
             raise ValueError("layer_ids must contain non-negative logical layer IDs")
-        if len(set(self.layer_ids)) != len(self.layer_ids):
-            raise ValueError("layer_ids must be unique")
+        if tuple(sorted(self.layer_ids)) != self.layer_ids or len(set(self.layer_ids)) != len(
+            self.layer_ids
+        ):
+            raise ValueError("layer_ids must be unique and ordered")
         if self.hidden_size < 1:
             raise ValueError("hidden_size must be positive")
         if self.dtype != "bfloat16" or self.input_dtype != "int64":
             raise ValueError("the packed format requires BF16 hidden and int64 IDs")
+        if self.schema_version not in (1, 2):
+            raise ValueError("only hidden cache schemas 1 and 2 are supported")
+        if self.schema_version == 1:
+            if self.capture_mapping:
+                raise ValueError("schema v1 cannot carry schema-v2 capture mapping")
+            return
+        if len(self.capture_mapping) != len(self.layer_ids):
+            raise ValueError("schema v2 needs one capture mapping per logical layer")
+        mapped_ids = tuple(int(value[1]) for value in self.capture_mapping)
+        if mapped_ids != self.layer_ids:
+            raise ValueError("capture mapping logical layer order differs from layer_ids")
+        if any(len(value) != 4 or not value[0] or not value[2] or not value[3] for value in self.capture_mapping):
+            raise ValueError("capture mapping entries require namespace, ID, tap, and semantics")
+        resolved_final = self.hidden_size if self.final_hidden_size is None else int(
+            self.final_hidden_size
+        )
+        object.__setattr__(self, "final_hidden_size", resolved_final)
+        if resolved_final != self.hidden_size:
+            raise ValueError("auxiliary and final hidden widths must match")
+        if self.final_hidden_dtype != "bfloat16":
+            raise ValueError("schema v2 final hidden must be BF16")
+        if self.final_hidden_semantics != FINAL_HIDDEN_SEMANTICS:
+            raise ValueError("schema v2 final hidden semantics are invalid")
+        if self.target_num_hidden_layers <= max(self.layer_ids):
+            raise ValueError("logical layer IDs exceed target decoder depth")
+
+
+def _spec_from_json(raw: Mapping[str, Any]) -> HiddenCacheSpec:
+    value = dict(raw)
+    value["layer_ids"] = tuple(int(item) for item in value["layer_ids"])
+    value["capture_mapping"] = tuple(
+        (str(item[0]), int(item[1]), str(item[2]), str(item[3]))
+        for item in value.get("capture_mapping", ())
+    )
+    return HiddenCacheSpec(**value)
+
+
+def _stream_names(spec: HiddenCacheSpec) -> tuple[str, ...]:
+    if spec.schema_version == 1:
+        return ("input_ids", "loss_mask", "hidden_states")
+    return ("input_ids", "loss_mask", "aux_hidden_states", "target_final_hidden")
+
+
+def _read_index(root: Path) -> list[dict[str, Any]]:
+    path = root / "index.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"corrupt index line {number}: {exc}") from exc
+    return rows
+
+
+def _row_streams(row: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(str(name) for name in row.get("nbytes", {}).keys())
+
+
+def _recover_unindexed_stream_tails(
+    root: Path, rows: Sequence[Mapping[str, Any]], streams: Sequence[str]
+) -> None:
+    committed: dict[tuple[int, str], int] = {}
+    last_rows: dict[int, Mapping[str, Any]] = {}
+    for row in rows:
+        if set(_row_streams(row)) != set(streams):
+            raise ValueError("index stream set differs from cache schema")
+        segment = int(row["segment"])
+        last_rows[segment] = row
+        for name in streams:
+            offset = int(row["offsets"][name])
+            end = offset + int(row["nbytes"][name])
+            key = (segment, name)
+            if offset < committed.get(key, 0):
+                raise ValueError(f"overlapping/out-of-order index range for {key}")
+            committed[key] = end
+    segments = {
+        int(path.name.split("-")[-1])
+        for path in root.glob("segment-*")
+        if path.is_dir()
+    }
+    segments.update(segment for segment, _ in committed)
+    for segment in segments:
+        segment_dir = root / f"segment-{segment:05d}"
+        for name in streams:
+            path = segment_dir / f"{name}.bin"
+            expected = committed.get((segment, name), 0)
+            actual = path.stat().st_size if path.exists() else 0
+            if actual < expected:
+                raise ValueError(
+                    f"committed index extends past {path}: expected {expected}, found {actual}"
+                )
+            if actual > expected:
+                with path.open("rb+") as handle:
+                    handle.truncate(expected)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        last = last_rows.get(segment)
+        if last is None:
+            continue
+        for name in streams:
+            path = segment_dir / f"{name}.bin"
+            with path.open("rb") as handle:
+                handle.seek(int(last["offsets"][name]))
+                raw = handle.read(int(last["nbytes"][name]))
+            if _sha256(raw) != str(last["sha256"][name]):
+                raise ValueError(
+                    f"checksum mismatch in last committed sample {last['sample_id']} stream {name}"
+                )
+
+
+def rebuild_manifest_from_index(
+    root: str | Path,
+    *,
+    spec: HiddenCacheSpec | None = None,
+    write: bool = True,
+) -> dict[str, Any]:
+    root = Path(root)
+    rows = _read_index(root)
+    path = root / "manifest.json"
+    old = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    raw_spec = asdict(spec) if spec is not None else old.get("spec")
+    schema = int(spec.schema_version) if spec is not None else int(
+        old.get("schema_version", (raw_spec or {}).get("schema_version", 1))
+    )
+    value = {
+        "schema_version": schema,
+        "status": old.get("status", "building"),
+        "spec": raw_spec,
+        "samples": len(rows),
+        "total_tokens": sum(int(row["tokens"]) for row in rows),
+        "segments": sorted({str(int(row["segment"])) for row in rows}, key=int),
+        "provenance": old.get("provenance", {}),
+    }
+    if write:
+        root.mkdir(parents=True, exist_ok=True)
+        _atomic_json(path, value)
+    return value
 
 
 class PackedHiddenWriter:
-    """Crash-recoverable, single-writer packed hidden-state cache."""
+    """Crash-recoverable single-writer cache for schemas v1 and v2."""
 
     def __init__(
         self,
@@ -77,6 +230,7 @@ class PackedHiddenWriter:
         self.provenance = dict(provenance or {})
         if self.max_segment_bytes < 1:
             raise ValueError("max_segment_bytes must be positive")
+        self._streams = _stream_names(spec)
         self._lock = self._index = None
         self._files: dict[str, Any] = {}
         self._segment = 0
@@ -94,27 +248,22 @@ class PackedHiddenWriter:
         index_path = self.root / "index.jsonl"
         repair_truncated_jsonl(index_path)
         existing = rebuild_manifest_from_index(self.root, spec=self.spec, write=False)
-        existing_rows = _read_index(self.root)
-        self._sample_ids = {str(row["sample_id"]) for row in existing_rows}
-        if len(self._sample_ids) != len(existing_rows):
+        rows = _read_index(self.root)
+        self._sample_ids = {str(row["sample_id"]) for row in rows}
+        if len(self._sample_ids) != len(rows):
             raise ValueError("hidden cache index contains duplicate sample_id values")
-        _recover_unindexed_stream_tails(self.root, existing_rows)
+        _recover_unindexed_stream_tails(self.root, rows, self._streams)
         manifest_path = self.root / "manifest.json"
         if manifest_path.exists():
             previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-            previous_spec = previous.get("spec")
-            if previous_spec:
-                normalized_spec = dict(previous_spec)
-                normalized_spec["layer_ids"] = tuple(normalized_spec["layer_ids"])
-                if HiddenCacheSpec(**normalized_spec) != self.spec:
-                    raise ValueError("hidden cache spec differs from existing manifest")
-            previous_provenance = previous.get("provenance")
-            if previous_provenance and previous_provenance != self.provenance:
+            if previous.get("spec") and _spec_from_json(previous["spec"]) != self.spec:
+                raise ValueError("hidden cache spec differs from existing manifest")
+            if previous.get("provenance") and previous["provenance"] != self.provenance:
                 raise ValueError("hidden cache provenance differs from existing manifest")
             if previous.get("status") == "frozen":
                 raise ValueError("cannot append to a frozen hidden cache")
         self._manifest = {
-            "schema_version": 1,
+            "schema_version": self.spec.schema_version,
             "status": "building",
             "spec": asdict(self.spec),
             "samples": existing["samples"],
@@ -128,8 +277,10 @@ class PackedHiddenWriter:
             self._segment = max(int(value) for value in existing["segments"])
             segment_dir = self.root / f"segment-{self._segment:05d}"
             self._segment_bytes = sum(
-                (segment_dir / name).stat().st_size if (segment_dir / name).exists() else 0
-                for name in ("input_ids.bin", "loss_mask.bin", "hidden_states.bin")
+                (segment_dir / f"{name}.bin").stat().st_size
+                if (segment_dir / f"{name}.bin").exists()
+                else 0
+                for name in self._streams
             )
         self._open_segment(self._segment)
         return self
@@ -140,15 +291,24 @@ class PackedHiddenWriter:
         segment_dir = self.root / f"segment-{segment:05d}"
         segment_dir.mkdir(parents=True, exist_ok=True)
         self._files = {
-            "input_ids": (segment_dir / "input_ids.bin").open("ab"),
-            "loss_mask": (segment_dir / "loss_mask.bin").open("ab"),
-            "hidden_states": (segment_dir / "hidden_states.bin").open("ab"),
+            name: (segment_dir / f"{name}.bin").open("ab") for name in self._streams
         }
         _fsync_dir(segment_dir)
         _fsync_dir(self.root)
         self._segment = segment
         if str(segment) not in self._manifest["segments"]:
             self._manifest["segments"].append(str(segment))
+
+    @staticmethod
+    def _bf16_raw(value: torch.Tensor) -> bytes:
+        return (
+            value.to(torch.bfloat16)
+            .contiguous()
+            .view(torch.uint16)
+            .numpy()
+            .astype("<u2", copy=False)
+            .tobytes(order="C")
+        )
 
     def append(
         self,
@@ -157,18 +317,25 @@ class PackedHiddenWriter:
         source_index: int,
         input_ids: torch.Tensor | Sequence[int],
         loss_mask: torch.Tensor | Sequence[int | bool],
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        aux_hidden_states: torch.Tensor | None = None,
+        target_final_hidden: torch.Tensor | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self._index is None:
             raise RuntimeError("writer is not open")
         ids = torch.as_tensor(input_ids, dtype=torch.int64).reshape(-1).cpu()
         mask = torch.as_tensor(loss_mask, dtype=torch.bool).reshape(-1).cpu()
-        hidden = torch.as_tensor(hidden_states).detach().cpu()
-        expected = (ids.numel(), len(self.spec.layer_ids), self.spec.hidden_size)
-        if tuple(hidden.shape) != expected:
-            raise ValueError(f"hidden_states shape {tuple(hidden.shape)} != {expected}")
-        if not bool(torch.isfinite(hidden).all()):
+        if hidden_states is not None and aux_hidden_states is not None:
+            raise ValueError("provide aux_hidden_states or hidden_states, not both")
+        aux_value = hidden_states if aux_hidden_states is None else aux_hidden_states
+        if aux_value is None:
+            raise ValueError("auxiliary hidden states are required")
+        aux = torch.as_tensor(aux_value).detach().cpu()
+        expected_aux = (ids.numel(), len(self.spec.layer_ids), self.spec.hidden_size)
+        if tuple(aux.shape) != expected_aux:
+            raise ValueError(f"hidden_states shape {tuple(aux.shape)} != {expected_aux}")
+        if not bool(torch.isfinite(aux).all()):
             raise ValueError("hidden_states contain NaN or Inf")
         if mask.numel() != ids.numel():
             raise ValueError("loss_mask length differs from input_ids")
@@ -177,29 +344,36 @@ class PackedHiddenWriter:
         if sample_id in self._sample_ids:
             raise ValueError(f"duplicate sample_id: {sample_id}")
 
-        ids_raw = ids.numpy().astype("<i8", copy=False).tobytes(order="C")
-        mask_raw = mask.numpy().astype("u1", copy=False).tobytes(order="C")
-        hidden_raw = (
-            hidden.to(torch.bfloat16)
-            .contiguous()
-            .view(torch.uint16)
-            .numpy()
-            .astype("<u2", copy=False)
-            .tobytes(order="C")
-        )
-        sample_bytes = len(ids_raw) + len(mask_raw) + len(hidden_raw)
+        raw: dict[str, bytes] = {
+            "input_ids": ids.numpy().astype("<i8", copy=False).tobytes(order="C"),
+            "loss_mask": mask.numpy().astype("u1", copy=False).tobytes(order="C"),
+        }
+        if self.spec.schema_version == 1:
+            if target_final_hidden is not None:
+                raise ValueError("schema v1 cannot store target_final_hidden")
+            raw["hidden_states"] = self._bf16_raw(aux)
+        else:
+            if target_final_hidden is None:
+                raise ValueError("schema v2 requires target_final_hidden")
+            final = torch.as_tensor(target_final_hidden).detach().cpu()
+            expected_final = (ids.numel(), self.spec.final_hidden_size)
+            if tuple(final.shape) != expected_final:
+                raise ValueError(
+                    f"target_final_hidden shape {tuple(final.shape)} != {expected_final}"
+                )
+            if not bool(torch.isfinite(final).all()):
+                raise ValueError("target_final_hidden contains NaN or Inf")
+            raw["aux_hidden_states"] = self._bf16_raw(aux)
+            raw["target_final_hidden"] = self._bf16_raw(final)
+
+        sample_bytes = sum(len(value) for value in raw.values())
         if self._segment_bytes and self._segment_bytes + sample_bytes > self.max_segment_bytes:
             self._open_segment(self._segment + 1)
             self._segment_bytes = 0
-
-        offsets = {name: handle.tell() for name, handle in self._files.items()}
-        for name, raw in (
-            ("input_ids", ids_raw),
-            ("loss_mask", mask_raw),
-            ("hidden_states", hidden_raw),
-        ):
+        offsets = {name: self._files[name].tell() for name in self._streams}
+        for name in self._streams:
             handle = self._files[name]
-            handle.write(raw)
+            handle.write(raw[name])
             handle.flush()
             os.fsync(handle.fileno())
         record = {
@@ -208,16 +382,8 @@ class PackedHiddenWriter:
             "segment": self._segment,
             "tokens": int(ids.numel()),
             "offsets": offsets,
-            "nbytes": {
-                "input_ids": len(ids_raw),
-                "loss_mask": len(mask_raw),
-                "hidden_states": len(hidden_raw),
-            },
-            "sha256": {
-                "input_ids": _sha256(ids_raw),
-                "loss_mask": _sha256(mask_raw),
-                "hidden_states": _sha256(hidden_raw),
-            },
+            "nbytes": {name: len(raw[name]) for name in self._streams},
+            "sha256": {name: _sha256(raw[name]) for name in self._streams},
             "metadata": dict(metadata or {}),
         }
         self._index.write(_compact_json(record) + "\n")
@@ -249,98 +415,6 @@ class PackedHiddenWriter:
             self._lock = None
 
 
-def _read_index(root: Path) -> list[dict[str, Any]]:
-    path = root / "index.jsonl"
-    if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as handle:
-        for number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"corrupt index line {number}: {exc}") from exc
-            rows.append(row)
-    return rows
-
-
-def _recover_unindexed_stream_tails(
-    root: Path, rows: Sequence[Mapping[str, Any]]
-) -> None:
-    """Truncate only bytes beyond committed index entries and check boundaries."""
-
-    committed: dict[tuple[int, str], int] = {}
-    last_rows: dict[int, Mapping[str, Any]] = {}
-    for row in rows:
-        segment = int(row["segment"])
-        last_rows[segment] = row
-        for name in ("input_ids", "loss_mask", "hidden_states"):
-            end = int(row["offsets"][name]) + int(row["nbytes"][name])
-            key = (segment, name)
-            if int(row["offsets"][name]) < committed.get(key, 0):
-                raise ValueError(f"overlapping/out-of-order index range for {key}")
-            committed[key] = end
-    segments = {int(path.name.split("-")[-1]) for path in root.glob("segment-*") if path.is_dir()}
-    segments.update(segment for segment, _ in committed)
-    for segment in segments:
-        segment_dir = root / f"segment-{segment:05d}"
-        for name in ("input_ids", "loss_mask", "hidden_states"):
-            path = segment_dir / f"{name}.bin"
-            expected = committed.get((segment, name), 0)
-            actual = path.stat().st_size if path.exists() else 0
-            if actual < expected:
-                raise ValueError(
-                    f"committed index extends past {path}: expected {expected}, found {actual}"
-                )
-            if actual > expected:
-                with path.open("rb+") as handle:
-                    handle.truncate(expected)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-        last = last_rows.get(segment)
-        if last is None:
-            continue
-        for name in ("input_ids", "loss_mask", "hidden_states"):
-            path = segment_dir / f"{name}.bin"
-            offset = int(last["offsets"][name])
-            length = int(last["nbytes"][name])
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                raw = handle.read(length)
-            if _sha256(raw) != str(last["sha256"][name]):
-                raise ValueError(
-                    f"checksum mismatch in last committed sample {last['sample_id']} stream {name}"
-                )
-
-
-def rebuild_manifest_from_index(
-    root: str | Path,
-    *,
-    spec: HiddenCacheSpec | None = None,
-    write: bool = True,
-) -> dict[str, Any]:
-    root = Path(root)
-    rows = _read_index(root)
-    old_path = root / "manifest.json"
-    old = json.loads(old_path.read_text()) if old_path.exists() else {}
-    resolved_spec = asdict(spec) if spec is not None else old.get("spec")
-    value = {
-        "schema_version": 1,
-        "status": old.get("status", "building"),
-        "spec": resolved_spec,
-        "samples": len(rows),
-        "total_tokens": sum(int(row["tokens"]) for row in rows),
-        "segments": sorted({str(int(row["segment"])) for row in rows}, key=int),
-        "provenance": old.get("provenance", {}),
-    }
-    if write:
-        root.mkdir(parents=True, exist_ok=True)
-        _atomic_json(old_path, value)
-    return value
-
-
 class PackedHiddenDataset(Dataset):
     def __init__(
         self,
@@ -348,6 +422,7 @@ class PackedHiddenDataset(Dataset):
         *,
         require_frozen: bool = True,
         verify_checksums: bool = False,
+        allow_legacy_v1: bool = False,
     ) -> None:
         self.root = Path(root)
         self.verify_checksums = bool(verify_checksums)
@@ -357,9 +432,15 @@ class PackedHiddenDataset(Dataset):
         raw_spec = self.manifest.get("spec")
         if not raw_spec:
             raise ValueError("hidden cache manifest has no spec")
-        raw_spec["layer_ids"] = tuple(raw_spec["layer_ids"])
-        self.spec = HiddenCacheSpec(**raw_spec)
+        self.spec = _spec_from_json(raw_spec)
+        if self.spec.schema_version == 1 and not allow_legacy_v1:
+            raise ValueError("legacy schema v1 requires allow_legacy_v1=True")
+        self.aligned_methods_allowed = self.spec.schema_version == 2
+        self._streams = _stream_names(self.spec)
         self.rows = _read_index(self.root)
+        for row in self.rows:
+            if set(_row_streams(row)) != set(self._streams):
+                raise ValueError("cache row stream set differs from manifest schema")
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -367,44 +448,54 @@ class PackedHiddenDataset(Dataset):
     def _slice(self, row: Mapping[str, Any], name: str, dtype: str) -> np.ndarray:
         path = self.root / f"segment-{int(row['segment']):05d}" / f"{name}.bin"
         itemsize = np.dtype(dtype).itemsize
-        count = int(row["nbytes"][name]) // itemsize
+        nbytes = int(row["nbytes"][name])
+        if nbytes % itemsize:
+            raise ValueError(f"stream {name} byte length is not dtype aligned")
         value = np.memmap(
             path,
             mode="r",
             dtype=dtype,
             offset=int(row["offsets"][name]),
-            shape=(count,),
+            shape=(nbytes // itemsize,),
         )
         if self.verify_checksums and _sha256(value.tobytes(order="C")) != str(
             row["sha256"][name]
         ):
-            raise ValueError(
-                f"checksum mismatch for sample {row['sample_id']} stream {name}"
-            )
+            raise ValueError(f"checksum mismatch for sample {row['sample_id']} stream {name}")
         return value
+
+    def _bf16(self, row: Mapping[str, Any], name: str, shape: tuple[int, ...]) -> torch.Tensor:
+        value = torch.from_numpy(np.array(self._slice(row, name, "<u2"), copy=True))
+        return value.view(torch.bfloat16).reshape(shape)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.rows[index]
         tokens = int(row["tokens"])
         ids = torch.from_numpy(np.array(self._slice(row, "input_ids", "<i8"), copy=True))
-        mask = torch.from_numpy(np.array(self._slice(row, "loss_mask", "u1"), copy=True)).bool()
-        hidden_u16 = torch.from_numpy(
-            np.array(self._slice(row, "hidden_states", "<u2"), copy=True)
+        mask = torch.from_numpy(
+            np.array(self._slice(row, "loss_mask", "u1"), copy=True)
+        ).bool()
+        aux_name = "hidden_states" if self.spec.schema_version == 1 else "aux_hidden_states"
+        aux = self._bf16(
+            row, aux_name, (tokens, len(self.spec.layer_ids), self.spec.hidden_size)
         )
-        hidden = hidden_u16.view(torch.bfloat16).reshape(
-            tokens, len(self.spec.layer_ids), self.spec.hidden_size
-        )
-        return {
+        result = {
             "sample_id": str(row["sample_id"]),
             "source_index": int(row["source_index"]),
             "input_ids": ids,
             "loss_mask": mask,
-            "layer_hidden_states": hidden,
-            # SpecForge DFlash consumes this flattened field as the
-            # ``hidden_states=...`` argument to its draft model.
-            "hidden_states": hidden.flatten(1),
+            "aux_hidden_states": aux,
+            "layer_hidden_states": aux,
+            "hidden_states": aux.flatten(1),
             "metadata": row.get("metadata", {}),
         }
+        if self.spec.schema_version == 2:
+            result["target_final_hidden"] = self._bf16(
+                row,
+                "target_final_hidden",
+                (tokens, int(self.spec.final_hidden_size)),
+            )
+        return result
 
 
 class DFlashHiddenCollator:
@@ -416,11 +507,20 @@ class DFlashHiddenCollator:
             raise ValueError("cannot collate an empty batch")
         max_tokens = max(int(row["input_ids"].numel()) for row in rows)
         hidden_width = int(rows[0]["hidden_states"].shape[-1])
+        has_final = "target_final_hidden" in rows[0]
+        if any(("target_final_hidden" in row) != has_final for row in rows):
+            raise ValueError("cannot mix schema v1 and v2 rows in one batch")
+        final_width = int(rows[0]["target_final_hidden"].shape[-1]) if has_final else 0
         batch = len(rows)
         input_ids = torch.full((batch, max_tokens), self.pad_token_id, dtype=torch.int64)
         attention_mask = torch.zeros((batch, max_tokens), dtype=torch.bool)
         loss_mask = torch.zeros((batch, max_tokens), dtype=torch.bool)
         hidden_states = torch.zeros((batch, max_tokens, hidden_width), dtype=torch.bfloat16)
+        target_final_hidden = (
+            torch.zeros((batch, max_tokens, final_width), dtype=torch.bfloat16)
+            if has_final
+            else None
+        )
         for index, row in enumerate(rows):
             length = int(row["input_ids"].numel())
             if int(row["hidden_states"].shape[-1]) != hidden_width:
@@ -429,10 +529,17 @@ class DFlashHiddenCollator:
             attention_mask[index, :length] = True
             loss_mask[index, :length] = row["loss_mask"]
             hidden_states[index, :length] = row["hidden_states"]
-        return {
+            if target_final_hidden is not None:
+                if int(row["target_final_hidden"].shape[-1]) != final_width:
+                    raise ValueError("target_final_hidden widths differ within a batch")
+                target_final_hidden[index, :length] = row["target_final_hidden"]
+        result = {
             "sample_ids": [str(row["sample_id"]) for row in rows],
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "loss_mask": loss_mask,
             "hidden_states": hidden_states,
         }
+        if target_final_hidden is not None:
+            result["target_final_hidden"] = target_final_hidden
+        return result
