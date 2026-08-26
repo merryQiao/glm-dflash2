@@ -137,17 +137,17 @@ hardware gate compares several short sequences against a direct model hook:
 - logits reconstructed from cached final hidden versus the target forward
   logits.
 
-The comparison uses fixed token fixtures and reports cosine similarity, maximum
-absolute error, and mean absolute error. A deterministic calibration runs each
-fixture three times through the direct reference and capture paths. For each
-metric, the checked-in pass threshold is the larger of an explicit numerical
-floor and twice the worst observed direct-versus-direct variation, and must
-remain strictly below the error produced by both negative controls. The floors,
-measured variations, final thresholds, model/runtime fingerprints, CANN,
-torch-npu, and SGLang versions are stored in a versioned gate artifact. A run
-without the matching artifact fails rather than recalibrating silently. Negative
-controls deliberately substitute a pre-norm tensor and shift one layer ID; both
-must fail.
+The comparison uses fixed token fixtures and reports three lower-is-better error
+metrics: `cosine_error = 1 - cosine_similarity`, maximum absolute error, and mean
+absolute error. A deterministic calibration runs each fixture three times
+through the direct reference and capture paths. For each error metric, the
+checked-in upper bound is the larger of an explicit numerical floor and twice
+the worst observed direct-versus-direct variation, and must remain strictly
+below the error produced by both negative controls. The floors, measured
+variations, final upper bounds, model/runtime fingerprints, CANN, torch-npu, and
+SGLang versions are stored in a versioned gate artifact. A run without the
+matching artifact fails rather than recalibrating silently. Negative controls
+deliberately substitute a pre-norm tensor and shift one layer ID; both must fail.
 
 ## Method consumers
 
