@@ -8,6 +8,8 @@ from typing import Any
 
 import torch
 
+from .hidden_capture import CaptureTap, TargetHiddenCapture
+
 
 GLM52_DFLASH_LOGICAL_LAYERS = (1, 20, 38, 56, 75)
 
@@ -105,6 +107,25 @@ class SGLangInternalHiddenRunner:
                 f"{tuple(reported_layers)} != {self.physical_layer_ids}"
             )
         self.hidden_size = int(self._runner.model_config.hidden_size)
+        self.capture_mapping = tuple(
+            CaptureTap(
+                backend_namespace="sglang",
+                logical_layer_id=logical,
+                concrete_tap=f"model.model.layers_to_capture[{physical}]",
+                tap_semantics="post_decoder_block",
+            )
+            for logical, physical in zip(
+                self.logical_layer_ids, self.physical_layer_ids, strict=True
+            )
+        )
+        final_norm = getattr(capture_owner, "norm", None)
+        if final_norm is None or not hasattr(final_norm, "register_forward_hook"):
+            raise RuntimeError(
+                "SGLang GLM model does not expose model.norm for post-final-norm capture"
+            )
+        self.final_hidden_tap = "model.model.norm.forward_output"
+        self._post_norm_hidden: torch.Tensor | None = None
+        self._final_hidden_hook = final_norm.register_forward_hook(self._capture_post_norm)
         try:
             import sglang
 
@@ -122,10 +143,46 @@ class SGLangInternalHiddenRunner:
             "chunked_prefill_size": int(server_args.chunked_prefill_size),
             "capture_mode": "FULL",
             "capture_hook": capture_hook,
+            "capture_mapping": [tap.as_tuple() for tap in self.capture_mapping],
+            "final_hidden_tap": self.final_hidden_tap,
+            "final_hidden_semantics": "post_final_norm_lm_head_input",
         }
 
+    def _capture_post_norm(self, *args: Any) -> None:
+        output = args[-1]
+        value = output[0] if isinstance(output, tuple) else output
+        if not isinstance(value, torch.Tensor) or value.ndim != 2:
+            raise RuntimeError("SGLang model.norm returned an unsupported hidden tensor")
+        self._post_norm_hidden = value
+
+    def _normalize_capture(
+        self, auxiliary: torch.Tensor, *, token_count: int
+    ) -> TargetHiddenCapture:
+        expected_width = len(self.logical_layer_ids) * self.hidden_size
+        if tuple(auxiliary.shape) != (token_count, expected_width):
+            raise RuntimeError(
+                f"captured auxiliary shape {tuple(auxiliary.shape)} != "
+                f"{(token_count, expected_width)}"
+            )
+        if self._post_norm_hidden is None:
+            raise RuntimeError("SGLang returned no post-final-norm hidden capture")
+        if tuple(self._post_norm_hidden.shape) != (token_count, self.hidden_size):
+            raise RuntimeError(
+                f"captured final hidden shape {tuple(self._post_norm_hidden.shape)} != "
+                f"{(token_count, self.hidden_size)}"
+            )
+        capture = TargetHiddenCapture(
+            aux_hidden_states=auxiliary.reshape(
+                token_count, len(self.logical_layer_ids), self.hidden_size
+            ),
+            target_final_hidden=self._post_norm_hidden,
+            capture_mapping=self.capture_mapping,
+        ).cpu_bfloat16()
+        self._post_norm_hidden = None
+        return capture
+
     @torch.no_grad()
-    def extract(self, input_ids: Sequence[int]) -> torch.Tensor:
+    def extract(self, input_ids: Sequence[int]) -> TargetHiddenCapture:
         from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.sampling.sampling_params import SamplingParams
@@ -136,6 +193,7 @@ class SGLangInternalHiddenRunner:
         if not input_ids:
             raise ValueError("cannot extract an empty sequence")
         self._clear_pools()
+        self._post_norm_hidden = None
         sampling = SamplingParams(temperature=0, max_new_tokens=1)
         req = Req(
             rid=0,
@@ -181,16 +239,19 @@ class SGLangInternalHiddenRunner:
         output = self._runner.forward(forward_batch).logits_output.hidden_states
         if output is None:
             raise RuntimeError("SGLang returned no captured hidden states")
-        expected = len(self.logical_layer_ids) * self.hidden_size
-        if tuple(output.shape) != (len(input_ids), expected):
-            raise RuntimeError(
-                f"captured hidden shape {tuple(output.shape)} != {(len(input_ids), expected)}"
+        capture = self._normalize_capture(output, token_count=len(input_ids))
+        if self.tp_rank == 0:
+            result = capture
+        else:
+            result = TargetHiddenCapture(
+                aux_hidden_states=torch.empty(
+                    0, len(self.logical_layer_ids), self.hidden_size, dtype=torch.bfloat16
+                ),
+                target_final_hidden=torch.empty(
+                    0, self.hidden_size, dtype=torch.bfloat16
+                ),
+                capture_mapping=self.capture_mapping,
             )
-        result = (
-            output.detach().to(dtype=torch.bfloat16, device="cpu")
-            if self.tp_rank == 0
-            else torch.empty(0, dtype=torch.bfloat16)
-        )
         self._clear_pools()
         return result
 

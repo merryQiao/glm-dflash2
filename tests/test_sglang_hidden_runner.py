@@ -6,6 +6,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+from torch import nn
+
 from glm_dflash2.sglang_hidden_runner import (
     SGLangInternalHiddenRunner,
     initialize_forward_batch,
@@ -16,9 +19,11 @@ from glm_dflash2.sglang_hidden_runner import (
 class FakeModel:
     def __init__(self):
         self.layers = None
+        self.model = SimpleNamespace(norm=nn.Identity(), layers_to_capture=[])
 
     def set_dflash_layers_to_capture(self, layers):
         self.layers = list(layers)
+        self.model.layers_to_capture = [int(value) + 1 for value in layers]
 
 
 class FakeGlmModel:
@@ -123,6 +128,14 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
         self.assertEqual(runner.physical_layer_ids, (2, 21, 39, 57, 76))
         self.assertEqual(runner.hidden_size, 6144)
         self.assertEqual(runner.backend_metadata["sglang_version"], "fake-version")
+        self.assertEqual(
+            runner.capture_mapping[0].concrete_tap,
+            "model.model.layers_to_capture[2]",
+        )
+        self.assertEqual(
+            runner.final_hidden_tap,
+            "model.model.norm.forward_output",
+        )
 
     def test_rejects_a_layer_order_that_cannot_be_identified_from_packed_output(self):
         model = FakeModel()
@@ -186,7 +199,7 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
 
     def test_constructor_uses_existing_glm_eagle3_capture_hook(self):
         model = FakeGlmModel()
-        model.model = SimpleNamespace(layers_to_capture=[])
+        model.model = SimpleNamespace(layers_to_capture=[], norm=nn.Identity())
         direct_runner = SimpleNamespace(
             model=model,
             model_config=SimpleNamespace(hidden_size=6144),
@@ -209,6 +222,59 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
             )
         self.assertEqual(model.layers, [1, 20, 38, 56, 75])
         self.assertEqual(runner.backend_metadata["capture_hook"], "set_eagle3_layers_to_capture")
+
+    def test_normalizes_aux_and_post_norm_from_one_forward(self):
+        model = FakeModel()
+        direct_runner = SimpleNamespace(
+            model=model,
+            model_config=SimpleNamespace(hidden_size=4),
+        )
+        one_batch = types.ModuleType("sglang.bench_one_batch")
+        one_batch.load_model = lambda *args: (direct_runner, "tokenizer")
+        sglang = types.ModuleType("sglang")
+        sglang.__path__ = []
+        modules = {"sglang": sglang, "sglang.bench_one_batch": one_batch}
+        server_args = SimpleNamespace(
+            tp_size=1, ep_size=1, pp_size=1, dp_size=1, chunked_prefill_size=-1
+        )
+        with patch.dict(sys.modules, modules):
+            runner = SGLangInternalHiddenRunner(
+                server_args=server_args,
+                port_args=object(),
+                gpu_id=0,
+                tp_rank=0,
+                logical_layer_ids=(1, 20, 38, 56, 75),
+            )
+        runner._capture_post_norm(model.model.norm(torch.ones(3, 4)))
+        capture = runner._normalize_capture(torch.zeros(3, 20), token_count=3)
+        self.assertEqual(tuple(capture.aux_hidden_states.shape), (3, 5, 4))
+        self.assertEqual(tuple(capture.target_final_hidden.shape), (3, 4))
+        self.assertEqual(capture.final_hidden_semantics, "post_final_norm_lm_head_input")
+
+    def test_missing_post_norm_capture_fails_closed(self):
+        model = FakeModel()
+        direct_runner = SimpleNamespace(
+            model=model,
+            model_config=SimpleNamespace(hidden_size=4),
+        )
+        one_batch = types.ModuleType("sglang.bench_one_batch")
+        one_batch.load_model = lambda *args: (direct_runner, "tokenizer")
+        sglang = types.ModuleType("sglang")
+        sglang.__path__ = []
+        modules = {"sglang": sglang, "sglang.bench_one_batch": one_batch}
+        server_args = SimpleNamespace(
+            tp_size=1, ep_size=1, pp_size=1, dp_size=1, chunked_prefill_size=-1
+        )
+        with patch.dict(sys.modules, modules):
+            runner = SGLangInternalHiddenRunner(
+                server_args=server_args,
+                port_args=object(),
+                gpu_id=0,
+                tp_rank=0,
+                logical_layer_ids=(1, 20, 38, 56, 75),
+            )
+        with self.assertRaisesRegex(RuntimeError, "post-final-norm"):
+            runner._normalize_capture(torch.zeros(3, 20), token_count=3)
 
 
 if __name__ == "__main__":

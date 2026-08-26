@@ -227,7 +227,9 @@ class PackedHiddenWriter:
         self.root = Path(root)
         self.spec = spec
         self.max_segment_bytes = int(max_segment_bytes)
-        self.provenance = dict(provenance or {})
+        # Normalize tuples/Path-like values to their exact persisted JSON form
+        # so resume comparison is representation-independent.
+        self.provenance = json.loads(_compact_json(dict(provenance or {})))
         if self.max_segment_bytes < 1:
             raise ValueError("max_segment_bytes must be positive")
         self._streams = _stream_names(spec)

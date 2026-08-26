@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 import torch
 
+from .hidden_capture import TargetHiddenCapture
 from .hidden_cache import HiddenCacheSpec, PackedHiddenWriter
 
 
@@ -18,8 +19,9 @@ class HiddenRunner(Protocol):
     hidden_size: int
     physical_layer_ids: Sequence[int]
     backend_metadata: Mapping[str, Any]
+    capture_mapping: Sequence[Any]
 
-    def extract(self, input_ids: Sequence[int]) -> torch.Tensor: ...
+    def extract(self, input_ids: Sequence[int]) -> TargetHiddenCapture: ...
 
 
 def estimate_packed_cache_bytes(
@@ -29,7 +31,7 @@ def estimate_packed_cache_bytes(
         raise ValueError("invalid cache-size dimensions")
     # BF16 hidden + int64 token ID + uint8 loss mask. JSON index overhead is
     # intentionally excluded and covered by the caller's safety factor.
-    return int(total_tokens) * (2 * int(num_layers) * int(hidden_size) + 8 + 1)
+    return int(total_tokens) * (2 * (int(num_layers) + 1) * int(hidden_size) + 8 + 1)
 
 
 def _trajectory_manifest(
@@ -123,11 +125,16 @@ def extract_trajectory_cache(
         "trajectory_manifest": source_manifest,
         "logical_layer_ids": list(logical),
         "physical_layer_ids": list(physical),
+        "capture_mapping": [tap.as_tuple() for tap in runner.capture_mapping],
         "backend": dict(runner.backend_metadata),
     }
     done = _existing_ids(output_dir)
     count = 0
-    spec = HiddenCacheSpec(layer_ids=logical, hidden_size=int(runner.hidden_size))
+    spec = HiddenCacheSpec(
+        layer_ids=logical,
+        hidden_size=int(runner.hidden_size),
+        capture_mapping=tuple(tap.as_tuple() for tap in runner.capture_mapping),
+    )
     with PackedHiddenWriter(
         output_dir,
         spec=spec,
@@ -145,24 +152,17 @@ def extract_trajectory_cache(
                 reached_eof = False
                 break
             input_ids = [int(value) for value in row["input_ids"]]
-            hidden = runner.extract(input_ids)
-            if hidden.ndim == 2:
-                expected_width = len(logical) * spec.hidden_size
-                if hidden.shape[1] != expected_width:
-                    raise ValueError(
-                        f"packed hidden width {hidden.shape[1]} != {expected_width}"
-                    )
-                hidden = hidden.reshape(len(input_ids), len(logical), spec.hidden_size)
-            expected = (len(input_ids), len(logical), spec.hidden_size)
-            if tuple(hidden.shape) != expected:
-                raise ValueError(f"hidden shape {tuple(hidden.shape)} != {expected}")
+            capture = runner.extract(input_ids)
+            if capture.logical_layer_ids != logical:
+                raise ValueError("runner capture mapping differs from requested logical layers")
             source_index = int(row.get("source_metadata", {}).get("selected_source_index", -1))
             writer.append(
                 sample_id=sample_id,
                 source_index=source_index,
                 input_ids=input_ids,
                 loss_mask=row["loss_mask"],
-                hidden_states=hidden,
+                aux_hidden_states=capture.aux_hidden_states,
+                target_final_hidden=capture.target_final_hidden,
                 metadata={
                     "token_contract": row.get("token_contract", {}),
                     "source_metadata": row.get("source_metadata", {}),

@@ -90,6 +90,7 @@ def _worker(
         "trajectory_sha256": _sha256(trajectory),
         "logical_layer_ids": list(layer_ids),
         "physical_layer_ids": list(runner.physical_layer_ids),
+        "capture_mapping": [tap.as_tuple() for tap in runner.capture_mapping],
         "backend": dict(runner.backend_metadata),
         "topology": {
             "tp_size": int(server_args.tp_size),
@@ -105,7 +106,11 @@ def _worker(
     writer_context = (
         PackedHiddenWriter(
             output,
-            spec=HiddenCacheSpec(layer_ids=layer_ids, hidden_size=runner.hidden_size),
+            spec=HiddenCacheSpec(
+                layer_ids=layer_ids,
+                hidden_size=runner.hidden_size,
+                capture_mapping=tuple(tap.as_tuple() for tap in runner.capture_mapping),
+            ),
             max_segment_bytes=max_segment_bytes,
             provenance=provenance,
         )
@@ -156,7 +161,7 @@ def _worker(
                 continue
             row = control
             sample_id = str(row["id"])
-            hidden = runner.extract(row["input_ids"])
+            capture = runner.extract(row["input_ids"])
             write_error = None
             if tp_rank == 0:
                 try:
@@ -168,9 +173,8 @@ def _worker(
                         source_index=source_index,
                         input_ids=row["input_ids"],
                         loss_mask=row["loss_mask"],
-                        hidden_states=hidden.reshape(
-                            len(row["input_ids"]), len(layer_ids), runner.hidden_size
-                        ),
+                        aux_hidden_states=capture.aux_hidden_states,
+                        target_final_hidden=capture.target_final_hidden,
                         metadata={
                             "source_metadata": row.get("source_metadata", {}),
                             "token_contract": row.get("token_contract", {}),

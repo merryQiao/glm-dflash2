@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from glm_dflash2.hidden_capture import CaptureTap, TargetHiddenCapture
 from glm_dflash2.hidden_cache import PackedHiddenDataset
 from glm_dflash2.hidden_extraction import (
     estimate_packed_cache_bytes,
@@ -19,17 +20,27 @@ class FakeRunner:
     hidden_size = 3
     physical_layer_ids = (2, 21, 39, 57, 76)
     backend_metadata = {"backend": "fake", "version": "test"}
+    capture_mapping = tuple(
+        CaptureTap("fake", layer, f"tap-{physical}", "post_decoder_block")
+        for layer, physical in zip((1, 20, 38, 56, 75), physical_layer_ids)
+    )
 
     def extract(self, input_ids):
         tokens = len(input_ids)
-        return torch.arange(tokens * 5 * 3).reshape(tokens, 5, 3).to(torch.bfloat16)
+        return TargetHiddenCapture(
+            aux_hidden_states=torch.arange(tokens * 5 * 3)
+            .reshape(tokens, 5, 3)
+            .to(torch.bfloat16),
+            target_final_hidden=torch.ones(tokens, 3, dtype=torch.bfloat16),
+            capture_mapping=self.capture_mapping,
+        )
 
 
 class HiddenExtractionTest(unittest.TestCase):
     def test_storage_estimate_includes_hidden_ids_and_mask(self):
         self.assertEqual(
             estimate_packed_cache_bytes(10, num_layers=5, hidden_size=6144),
-            10 * (5 * 6144 * 2 + 9),
+            10 * (6 * 6144 * 2 + 9),
         )
 
     def _write_trajectory(self, root: Path, *, status: str = "frozen") -> Path:
@@ -81,9 +92,11 @@ class HiddenExtractionTest(unittest.TestCase):
             self.assertEqual(count, 1)
             dataset = PackedHiddenDataset(output)
             self.assertEqual(dataset[0]["input_ids"].tolist(), [1, 2, 3])
+            self.assertEqual(tuple(dataset[0]["target_final_hidden"].shape), (3, 3))
             provenance = dataset.manifest["provenance"]
             self.assertEqual(provenance["logical_layer_ids"], [1, 20, 38, 56, 75])
             self.assertEqual(provenance["physical_layer_ids"], [2, 21, 39, 57, 76])
+            self.assertEqual(len(provenance["capture_mapping"]), 5)
 
     def test_max_samples_leaves_building_cache_that_can_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
