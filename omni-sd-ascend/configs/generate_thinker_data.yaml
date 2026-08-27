@@ -1,0 +1,109 @@
+dataset_name: qwen3_omni_thinker_generated_trajectories
+
+# The accepted marker is mandatory: trajectory generation must never start
+# from a partial candidate mixture.
+input:
+  conditions: data/thinker_speculative_2m/accepted/train.parquet
+  success_marker: data/thinker_speculative_2m/accepted/_DATASET_SUCCESS.json
+  expected_conditions: 2000000
+
+output:
+  root: data/thinker_speculative_2m/thinker_data
+  conditions_per_shard: 256
+
+model:
+  id: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  path: ../pretrained_models/Qwen/Qwen3-Omni-30B-A3B-Instruct
+  # Resolve these to immutable commits before a production run.
+  revision: REPLACE_WITH_MODEL_REVISION
+  processor_revision: REPLACE_WITH_PROCESSOR_REVISION
+  dtype: bfloat16
+
+generation:
+  # These are the default arguments of the official web_demo.py predict()
+  # function. The UI may override them, and generation_config.json only
+  # specifies Talker parameters, so every Thinker parameter is explicit here.
+  sampling_profile: qwen3_omni_instruct_official_interactive
+  do_sample: true
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  repetition_penalty: 1.0
+  max_new_tokens: 2048
+  eos_token_id: 151645
+  stop_token_ids: [151645]
+  use_audio_in_video: true
+  system_prompt: null
+  master_seed: 20260827
+  max_model_tokens: 32768
+  # Qwen's processor evaluates video at 2 FPS and uniformly caps very long
+  # clips at its official 768-frame limit while retaining the full audio.
+  video_fps: 2.0
+  video_min_frames: 4
+  video_max_frames: 768
+  # At most 8,192 visual tokens per image keeps two-image conditions within
+  # the 32k Thinker context without changing the official processor.
+  image_max_pixels: 6422528
+
+runtime:
+  backend: vllm_ascend
+  # Set to a2 or a3 and expose exactly the chip IDs allocated to the job.
+  hardware: a2
+  tensor_parallel_size: 4
+  enable_expert_parallel: true
+  distributed_executor_backend: mp
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 16
+  # Native hidden extraction forbids chunked prefill, so this must cover the
+  # longest teacher-forced sequence.
+  max_num_batched_tokens: 32768
+  limit_mm_per_prompt:
+    image: 8
+    video: 1
+    audio: 8
+  enforce_eager: false
+  enable_prefix_caching: false
+  quantization: null
+
+vllm_batch_size:
+  text: 8
+  image: 2
+  multi_image: 1
+  audio: 2
+  video: 1
+  other: 1
+
+hidden_states:
+  backend: vllm_ascend
+  output_root: data/thinker_speculative_2m/thinker_hidden
+  scratch_root: data/thinker_speculative_2m/thinker_hidden/.connector
+  # Qwen3-Omni Thinker has 48 text decoder layers and hidden width 2048.
+  # Keep these IDs identical to the downstream drafter configuration.
+  layer_ids: [1, 12, 24, 36, 47]
+  num_target_layers: 48
+  hidden_size: 2048
+  dtype: bfloat16
+  require_final_normalized_hidden: true
+  # vLLM exposes layer 48 as the raw post-decoder/pre-final-norm state. The
+  # pipeline loads this exact checkpoint weight and applies the official RMSNorm
+  # formula offline, then parity-checks it against a reference Thinker forward.
+  final_norm_weight_key: thinker.model.norm.weight
+  final_norm_epsilon: 1.0e-6
+  max_shard_bytes: 4294967296
+  batch_size:
+    text: 4
+    image: 1
+    multi_image: 1
+    audio: 1
+    video: 1
+    other: 1
+
+# Retained only for compatibility with the original direct-Transformers
+# reference script. Production generation uses vllm_batch_size above.
+batch_size:
+  text: 8
+  image: 2
+  multi_image: 1
+  audio: 2
+  video: 1
+  other: 1

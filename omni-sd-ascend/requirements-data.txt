@@ -1,0 +1,7 @@
+# Install these into the official vLLM-Ascend image. Do not pip-replace its
+# torch, torch-npu, vLLM, or vLLM-Ascend wheels.
+pyarrow>=17.0.0
+safetensors>=0.4.5
+PyYAML>=6.0.2
+qwen-omni-utils>=0.0.9
+pytest>=8.3.0
