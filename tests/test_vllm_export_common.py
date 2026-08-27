@@ -10,7 +10,7 @@ from glm_dflash2.vllm_ascend.export_common import (
     load_candidate_export,
     write_candidate_export,
 )
-from tests.export_test_utils import flip_one_byte, tiny_target_io
+from export_test_utils import flip_one_byte, tiny_target_io
 
 
 class CommonExportTest(unittest.TestCase):

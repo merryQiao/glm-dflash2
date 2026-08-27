@@ -6,7 +6,7 @@ from pathlib import Path
 
 from glm_dflash2.vllm_ascend.export_dflash import export_dflash
 from glm_dflash2.vllm_ascend.export_common import load_candidate_export
-from tests.export_test_utils import tiny_config, tiny_target_io
+from export_test_utils import tiny_config, tiny_target_io
 from tools.train_drafter_offline import build_method_model
 
 

@@ -9,7 +9,7 @@ import torch
 from glm_dflash2.vllm_ascend.export_dflash2 import export_dflash2
 from integrations.vllm_ascend.dflash2_model_loader import load_dflash2_candidate
 from integrations.vllm_ascend.dflash2_proposer import rerank_topk_candidates
-from tests.export_test_utils import tiny_config, tiny_target_io
+from export_test_utils import tiny_config, tiny_target_io
 from tools.train_drafter_offline import build_method_model
 
 

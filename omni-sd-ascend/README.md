@@ -1,5 +1,9 @@
 # Qwen3-Omni Thinker data pipeline for Ascend 910B A2/A3
 
+For server-side takeover, read [`AI_HANDOFF.md`](AI_HANDOFF.md) first. It
+separates locally verified contracts from the A2/A3 gates that still require
+the destination vLLM-Ascend image.
+
 This directory contains the production-oriented, two-stage data path for a
 Qwen3-Omni speculative drafter. It handles the **Thinker text stream only**;
 Talker and Code2Wav are deliberately not loaded.

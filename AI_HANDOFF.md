@@ -1,11 +1,15 @@
 # GLM-5.2 DFlash / DFlash2 / DSpark 服务器接管手册
 
 更新时间：2026-08-27
-仓库实现分支：`feature/vllm-ascend-export-runtime`
+GitHub 默认分支：`main`（本次审查工作分支：`fix/stage-a-concurrency`）
 
 > 这是服务器端 AI 的唯一接管入口。先完整读完本文，再看 `README.md` 和
 > `docs/ASCEND_910B_RUNBOOK.md` 中的命令细节。本文记录的是“当前真实状态”，不把
 > CPU smoke、离线 export 或已有 GLM 服务误写成 910B 端到端已经打通。
+
+Qwen3-Omni 是一条独立实验链，请读
+`omni-sd-ascend/AI_HANDOFF.md`；不要把它的 2048 维 Thinker hidden、48 层定义或
+vLLM-Ascend 配置带入本 GLM-5.2 流程。
 
 ## 1. 最终目标
 
@@ -69,7 +73,8 @@ physical block 的第一个位置是已知 anchor，不能把 B8/B16 错写成 8
 2026-08-27 的本分支验收记录：
 
 ```text
-unit tests                     226 passed
+GLM unit tests                 218 passed
+Omni unit tests                31 passed (independent subproject)
 all scripts bash -n            passed
 src/tools/tests compileall     passed
 git diff --check               passed
@@ -82,15 +87,15 @@ tiny optimizer smoke           DFlash loss 2.586278
 复现命令：
 
 ```bash
-PYTHONPATH=src /tmp/glm-dflash2-test-py312/bin/python \
+PYTHONPATH=src /path/to/python \
   -m unittest discover -s tests -p 'test_*.py'
 find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-PYTHONPATH=src /tmp/glm-dflash2-test-py312/bin/python -m compileall -q src tools tests
-PY=/tmp/glm-dflash2-test-py312/bin/python bash scripts/smoke_no_model.sh
+PYTHONPATH=src /path/to/python -m compileall -q src tools tests
+PY=/path/to/python bash scripts/smoke_no_model.sh
 ```
 
-`/tmp/glm-dflash2-test-py312` 是当前机器的测试环境，不是可迁移依赖。服务器端应使用
-厂商 torch-npu 环境重新执行相同 gate。
+服务器端必须使用厂商配套的 torch-npu/CANN 环境重新执行相同 gate，不要安装
+通用 PyPI torch 覆盖厂商栈。
 
 ### 2.3 仍未完成，禁止提前宣称
 

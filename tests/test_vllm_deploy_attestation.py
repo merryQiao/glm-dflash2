@@ -11,8 +11,8 @@ from glm_dflash2.vllm_ascend.parity import (
     candidate_binding,
     validate_deploy_attestation,
 )
-from tests.export_test_utils import flip_one_byte, tiny_config, tiny_target_io
-from tests.test_vllm_capability import runtime_identity
+from export_test_utils import flip_one_byte, tiny_config, tiny_target_io
+from test_vllm_capability import runtime_identity
 from tools.train_drafter_offline import build_method_model
 
 

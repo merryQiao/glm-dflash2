@@ -1,5 +1,16 @@
 # GLM-5.2 unified speculative-drafter pipeline
 
+This repository now contains two independent Ascend workstreams. Do not mix
+their models, cache schemas, or runtime assumptions:
+
+- the repository root is the **GLM-5.2 BF16** DFlash/DFlash2/DSpark pipeline;
+- [`omni-sd-ascend/`](omni-sd-ascend/) is the **Qwen3-Omni Thinker-only**
+  trajectory, hidden-cache, and inference-profiling pipeline (solution B:
+  vLLM-Ascend for both passes).
+
+Server-side takeover starts from [`AI_HANDOFF.md`](AI_HANDOFF.md) for GLM-5.2
+and [`omni-sd-ascend/AI_HANDOFF.md`](omni-sd-ascend/AI_HANDOFF.md) for Omni.
+
 This repository builds one sampled GLM-5.2 BF16 training corpus and one
 schema-v2 hidden cache, then trains three aligned offline consumers on Ascend
 910B: **DFlash**, **DFlash2**, and **DSpark**. The target backbone is used only
