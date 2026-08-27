@@ -196,6 +196,22 @@ def write_candidate_export(
     output_dir = Path(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     metadata = _validate_metadata(method, method_metadata)
+    required_target_identity = (
+        "source_model_fingerprint",
+        "model_revision",
+        "tokenizer_fingerprint",
+        "weights_sha256",
+    )
+    missing_target_identity = [
+        key
+        for key in required_target_identity
+        if str(target_io.manifest.get(key, "")).strip().lower()
+        in {"", "unknown", "none", "null"}
+    ]
+    if missing_target_identity:
+        raise ValueError(
+            "target I/O identity is incomplete: " + ", ".join(missing_target_identity)
+        )
     state = cpu_state(weights)
     for key, value in (
         ("embed_tokens.weight", target_io.embed_tokens.weight),

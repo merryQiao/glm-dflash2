@@ -73,6 +73,24 @@ class CommonExportTest(unittest.TestCase):
                     },
                 )
 
+        broken = tiny_target_io()
+        broken.manifest.pop("weights_sha256")
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ValueError, "target I/O identity"):
+            write_candidate_export(
+                Path(tmp) / "export",
+                method="dflash",
+                config={"block_size": 8},
+                weights={"fc.weight": torch.zeros(8, 40)},
+                target_io=broken,
+                method_metadata={
+                    "aux_hidden_state_layer_ids": [1, 20, 38, 56, 75],
+                    "block_size": 8,
+                    "num_speculative_tokens": 7,
+                    "sample_from_anchor": False,
+                    "method_parameters": {},
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,7 @@ class SpeculatorExportTest(unittest.TestCase):
             "model_type": "glm_moe_dsa",
             "vocab_size": 17,
             "hidden_size": 8,
+            "weights_sha256": "target-io-sha",
             "tensors": {},
         }
         return FrozenTargetIO(embed, head, manifest)
@@ -88,8 +89,10 @@ class SpeculatorExportTest(unittest.TestCase):
                 manifest = json.loads((Path(tmp) / "export_manifest.json").read_text())
                 self.assertEqual(
                     manifest["runtime_compatibility"],
-                    "custom-glm52-vllm-ascend-adapter-required",
+                    "candidate-requires-runtime-attestation",
                 )
+                self.assertEqual(manifest["schema"], "glm-drafter-speculator-export-v2")
+                self.assertEqual(manifest["status"], "candidate-not-deployable")
                 self.assertEqual(manifest["target_model_fingerprint"], "model-sha")
                 self.assertTrue((Path(tmp) / "config.py").is_file())
 
@@ -114,8 +117,34 @@ class SpeculatorExportTest(unittest.TestCase):
                 self.assertTrue(torch.equal(loaded.lm_head_weight, target_io.lm_head.weight))
                 self.assertEqual(
                     loaded.manifest["runtime_compatibility"],
-                    "custom-glm52-vllm-ascend-adapter-required",
+                    "candidate-requires-runtime-attestation",
                 )
+
+    def test_schema_v1_remains_readable_but_untrusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._config(block_size=8)
+            model = build_method_model("dflash", config, markov_rank=4)
+            export_speculator(
+                root, method="dflash", config=config, model=model, target_io=self._target_io()
+            )
+            manifest = json.loads((root / "export_manifest.json").read_text())
+            legacy = {
+                "schema": "glm-drafter-speculator-export-v1",
+                "method": "dflash",
+                "runtime_compatibility": "custom-glm52-vllm-ascend-adapter-required",
+                "config_sha256": manifest["config_sha256"],
+                "weights_sha256": manifest["weights_sha256"],
+                "target_model_fingerprint": manifest["target_model_fingerprint"],
+                "target_model_revision": manifest["target_model_revision"],
+                "tokenizer_fingerprint": manifest["tokenizer_fingerprint"],
+                "sample_from_anchor": False,
+                "num_speculative_tokens": 7,
+            }
+            (root / "export_manifest.json").write_text(json.dumps(legacy))
+            loaded = load_exported_speculator(root)
+            self.assertEqual(loaded.method, "dflash")
+            self.assertEqual(loaded.manifest["trust_status"], "legacy-untrusted")
 
 
 if __name__ == "__main__":
