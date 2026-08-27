@@ -19,7 +19,7 @@ from omni_sd.inference_profile import (
     normalize_input_record,
     profile_batch_kind,
     reduce_hbm_measurements,
-    request_latency_seconds,
+    request_stage_latencies_seconds,
     score_prediction,
     validate_evaluation_contract,
     worker_reset_npu_peak,
@@ -234,14 +234,20 @@ def test_profile_performance_uses_weighted_engine_and_end_to_end_denominators():
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
                 "preprocess_seconds": 0.1,
-                "engine_request_seconds": 0.5,
+                "queue_seconds": 0.1,
+                "prefill_seconds": 0.2,
+                "decode_seconds": 0.0,
+                "engine_inference_seconds": 0.2,
             },
             {
                 "modality": "audio",
                 "prompt_tokens": 20,
                 "completion_tokens": 15,
                 "preprocess_seconds": 0.3,
-                "engine_request_seconds": None,
+                "queue_seconds": None,
+                "prefill_seconds": None,
+                "decode_seconds": None,
+                "engine_inference_seconds": None,
             },
         ],
         batches=[
@@ -280,9 +286,19 @@ def test_profile_performance_uses_weighted_engine_and_end_to_end_denominators():
         20 / 4.7
     )
     assert overall["request_preprocess_latency_ms"]["mean"] == pytest.approx(200)
-    assert overall["request_engine_latency_ms"]["available"] is True
-    assert overall["request_engine_latency_ms"]["observed"] == 1
-    assert overall["request_engine_latency_ms"]["missing"] == 1
+    assert overall["request_queue_latency_ms"]["mean"] == pytest.approx(100.0)
+    assert overall["request_prefill_latency_ms"]["mean"] == pytest.approx(200.0)
+    assert overall["request_decode_latency_ms"]["mean"] == pytest.approx(0.0)
+    inference = overall["request_engine_inference_latency_ms"]
+    assert inference["available"] is True
+    assert inference["observed"] == 1
+    assert inference["missing"] == 1
+    assert summary["by_modality"]["text"]["request_decode_latency_ms"][
+        "available"
+    ] is True
+    assert summary["by_modality"]["audio"]["request_decode_latency_ms"][
+        "available"
+    ] is False
     assert summary["by_modality"]["text"]["completion_tokens_per_second"] == 5.0
     assert summary["by_modality"]["audio"][
         "completion_tokens_per_second"
@@ -483,16 +499,67 @@ def test_worker_hbm_rpc_uses_rank_local_torch_npu_allocator(monkeypatch):
     }
 
 
-def test_request_latency_uses_only_vllm_metrics_without_batch_fallback():
+def test_request_stage_latencies_use_vllm_monotonic_timestamps():
     class Metrics:
         arrival_time = 10.0
-        finished_time = 10.75
+        queued_ts = 100.0
+        scheduled_ts = 100.1
+        first_token_ts = 100.3
+        last_token_ts = 100.8
 
     class Output:
         metrics = Metrics()
 
-    assert request_latency_seconds(Output()) == pytest.approx(0.75)
-    assert request_latency_seconds(object()) is None
+    assert request_stage_latencies_seconds(Output()) == pytest.approx(
+        {
+            "queue_seconds": 0.1,
+            "prefill_seconds": 0.2,
+            "decode_seconds": 0.5,
+            "engine_inference_seconds": 0.7,
+        }
+    )
+
+
+def test_request_stage_latencies_keep_zero_decode_and_isolate_invalid_intervals():
+    class Metrics:
+        queued_ts = 20.0
+        scheduled_ts = 19.0  # Invalid queue interval only.
+        first_token_ts = 21.0
+        last_token_ts = 21.0  # One-token generation has zero decode duration.
+
+    class Output:
+        metrics = Metrics()
+
+    assert request_stage_latencies_seconds(Output()) == {
+        "queue_seconds": None,
+        "prefill_seconds": 2.0,
+        "decode_seconds": 0.0,
+        "engine_inference_seconds": 2.0,
+    }
+    assert request_stage_latencies_seconds(object()) == {
+        "queue_seconds": None,
+        "prefill_seconds": None,
+        "decode_seconds": None,
+        "engine_inference_seconds": None,
+    }
+
+
+def test_request_stage_latencies_reject_non_finite_timestamps():
+    class Metrics:
+        queued_ts = float("nan")
+        scheduled_ts = 1.0
+        first_token_ts = 2.0
+        last_token_ts = 3.0
+
+    class Output:
+        metrics = Metrics()
+
+    assert request_stage_latencies_seconds(Output()) == {
+        "queue_seconds": None,
+        "prefill_seconds": 1.0,
+        "decode_seconds": 1.0,
+        "engine_inference_seconds": 2.0,
+    }
 
 
 def test_cli_dry_run_reuses_production_provider_without_importing_vllm(
@@ -542,7 +609,10 @@ def test_measured_profile_excludes_warmup_and_keeps_exact_ids(monkeypatch):
 
     class Metrics:
         arrival_time = 1.0
-        finished_time = 1.25
+        queued_ts = 10.0
+        scheduled_ts = 10.1
+        first_token_ts = 10.3
+        last_token_ts = 10.7
 
     class Completion:
         token_ids = [20, 21, 151645]
@@ -647,7 +717,13 @@ def test_measured_profile_excludes_warmup_and_keeps_exact_ids(monkeypatch):
     ]
     assert all(record["evaluation_result"]["correct"] for record in records)
     assert records[0]["preprocess_latency_ms"] == pytest.approx(100.0)
-    assert records[0]["request_engine_latency_ms"] == pytest.approx(250.0)
+    assert records[0]["request_queue_latency_ms"] == pytest.approx(100.0)
+    assert records[0]["request_prefill_latency_ms"] == pytest.approx(200.0)
+    assert records[0]["request_decode_latency_ms"] == pytest.approx(400.0)
+    assert records[0]["request_engine_inference_latency_ms"] == pytest.approx(600.0)
+    assert overall["request_engine_inference_latency_ms"]["p50"] == pytest.approx(
+        600.0
+    )
     assert records[0]["batch_engine_latency_ms"] == pytest.approx(100.0)
     assert records[0]["batch_end_to_end_latency_ms"] == pytest.approx(700.0)
     assert llm.rpc_calls == ["worker_reset_npu_peak", "worker_snapshot_npu_memory"]

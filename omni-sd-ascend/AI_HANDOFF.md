@@ -122,7 +122,10 @@ bash scripts/profile_thinker_ascend.sh \
 
 性能报告只包含 Thinker；必须报告 model-load/warmup 时间、实测 wall time、
 engine-only 与 end-to-end 的 request/s、completion-token TPS、total-token TPS、按模态
-latency/throughput，以及每个 TP worker 的 `torch_npu_allocator` HBM。默认缺 HBM 即失败；
+latency/throughput，以及每个 TP worker 的 `torch_npu_allocator` HBM。vLLM 0.23 的
+request 时间只允许使用同一 monotonic clock 的 queue、prefill、decode 和
+scheduled-to-last-token inference 四段；这些不是 NPU kernel 时间，也不是完整 request E2E，
+不得把 wall-clock `arrival_time` 与 monotonic 字段相减。默认缺 HBM 即失败；
 `--allow-missing-hbm` 只允许用于诊断，不能用于正式表格。不要把 dry-run 的 plan JSON
 当成性能结果，也不要把 batch latency 复制成每个 request 的 latency。
 

@@ -38,7 +38,7 @@ from omni_sd.inference_profile import (  # noqa: E402
     profile_batch_kind,
     profile_batches,
     reduce_hbm_measurements,
-    request_latency_seconds,
+    request_stage_latencies_seconds,
     validate_evaluation_contract,
     validate_hbm_worker_identities,
     worker_reset_npu_peak,
@@ -579,7 +579,7 @@ def run_profile(
             zip(batch, outputs, strict=True)
         ):
             payload = completion_payload(output, eos)
-            request_latency = request_latency_seconds(output)
+            stage_latencies = request_stage_latencies_seconds(output)
             preprocess_elapsed = float(
                 measurement["preprocess_request_seconds"][request_index]
             )
@@ -590,7 +590,7 @@ def run_profile(
                     "prompt_tokens": int(payload["prompt_tokens"]),
                     "completion_tokens": int(payload["response_tokens"]),
                     "preprocess_seconds": preprocess_elapsed,
-                    "engine_request_seconds": request_latency,
+                    **stage_latencies,
                     "batch_index": batch_index,
                 }
             )
@@ -610,11 +610,12 @@ def run_profile(
                     "evaluation_json": row.get("evaluation_json"),
                     "evaluation_result": row_evaluation,
                     "preprocess_latency_ms": preprocess_elapsed * 1000.0,
-                    "request_engine_latency_ms": (
-                        request_latency * 1000.0
-                        if request_latency is not None
-                        else None
-                    ),
+                    **{
+                        f"request_{name.removesuffix('_seconds')}_latency_ms": (
+                            value * 1000.0 if value is not None else None
+                        )
+                        for name, value in stage_latencies.items()
+                    },
                     "batch_index": batch_index,
                     "batch_engine_latency_ms": measurement["engine_seconds"] * 1000.0,
                     "batch_end_to_end_latency_ms": measurement["end_to_end_seconds"]
@@ -693,14 +694,14 @@ def print_summary(profile: dict[str, Any]) -> None:
         "  end-to-end completion TPS: "
         f"{overall['end_to_end']['completion_tokens_per_second']:.3f}"
     )
-    latency = overall["request_engine_latency_ms"]
+    latency = overall["request_engine_inference_latency_ms"]
     if latency["available"]:
         print(
-            "  request engine p50/p95:  "
+            "  engine inference p50/p95: "
             f"{latency['p50']:.3f} / {latency['p95']:.3f} ms"
         )
     else:
-        print("  request engine latency:  unavailable")
+        print("  engine inference latency: unavailable")
 
 
 def main() -> None:

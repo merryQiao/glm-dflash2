@@ -173,10 +173,13 @@ is recorded only by the performance invocation, not the training manifest.
 The profile separates host preprocessing, the enclosing `LLM.generate` call,
 and outer end-to-end batch time. It reports engine-only and end-to-end
 requests/s, completion-token TPS, and total-token TPS; per-request
-preprocessing latency; vLLM request latency only when vLLM exposes valid
-arrival/finish timestamps; and batch engine/end-to-end distributions. The
-same report is repeated under `performance.by_modality` using modality-local
-time denominators. Exact prompt and response token IDs are written for every
+preprocessing latency; and batch engine/end-to-end distributions. From pinned
+vLLM 0.23's engine-core monotonic timestamps it also reports optional request
+queue, prefill, decode, and scheduled-to-last-token inference intervals. These
+are engine event intervals, not NPU kernel time or request end-to-end time;
+wall-clock `arrival_time` is never mixed with monotonic timestamps. The same
+report is repeated under `performance.by_modality` using modality-local time
+denominators. Exact prompt and response token IDs are written for every
 measured request.
 
 Every successful real run publishes three files: the JSONL, the profile JSON,

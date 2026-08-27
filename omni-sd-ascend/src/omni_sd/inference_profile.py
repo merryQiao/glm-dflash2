@@ -395,10 +395,18 @@ def _percentile(values: Sequence[float], quantile: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def _latency_summary(seconds: Sequence[float]) -> dict[str, float]:
+def _latency_summary(
+    seconds: Sequence[float], *, allow_zero: bool = False
+) -> dict[str, float]:
     milliseconds = [float(value) * 1000.0 for value in seconds]
-    if not milliseconds or any(value <= 0 for value in milliseconds):
-        raise ProfileContractError("latencies must be positive")
+    invalid = (
+        any(value < 0 for value in milliseconds)
+        if allow_zero
+        else any(value <= 0 for value in milliseconds)
+    )
+    if not milliseconds or invalid:
+        requirement = "non-negative" if allow_zero else "positive"
+        raise ProfileContractError(f"latencies must be {requirement}")
     return {
         "mean": sum(milliseconds) / len(milliseconds),
         "p50": _percentile(milliseconds, 0.50),
@@ -408,17 +416,30 @@ def _latency_summary(seconds: Sequence[float]) -> dict[str, float]:
     }
 
 
-def request_latency_seconds(output: Any) -> float | None:
-    """Return vLLM's request latency, without inventing a batch fallback."""
+def request_stage_latencies_seconds(output: Any) -> dict[str, float | None]:
+    """Return valid intervals from vLLM 0.23 engine-core monotonic timestamps."""
 
     metrics = getattr(output, "metrics", None)
-    arrival = getattr(metrics, "arrival_time", None)
-    finished = getattr(metrics, "finished_time", None)
-    if isinstance(arrival, (int, float)) and isinstance(finished, (int, float)):
-        elapsed = float(finished) - float(arrival)
-        if elapsed > 0:
-            return elapsed
-    return None
+
+    def interval(start_name: str, end_name: str) -> float | None:
+        start = getattr(metrics, start_name, None)
+        end = getattr(metrics, end_name, None)
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            return None
+        start_value = float(start)
+        end_value = float(end)
+        if not math.isfinite(start_value) or not math.isfinite(end_value):
+            return None
+        if start_value <= 0 or end_value <= 0 or end_value < start_value:
+            return None
+        return end_value - start_value
+
+    return {
+        "queue_seconds": interval("queued_ts", "scheduled_ts"),
+        "prefill_seconds": interval("scheduled_ts", "first_token_ts"),
+        "decode_seconds": interval("first_token_ts", "last_token_ts"),
+        "engine_inference_seconds": interval("scheduled_ts", "last_token_ts"),
+    }
 
 
 def _evaluation_payload(value: Any) -> dict[str, str] | None:
@@ -567,7 +588,7 @@ def _optional_latency_summary(
         "missing": len(seconds) - len(observed),
     }
     if observed:
-        result.update(_latency_summary(observed))
+        result.update(_latency_summary(observed, allow_zero=True))
     else:
         result["reason"] = "vLLM request timestamps unavailable"
     return result
@@ -630,8 +651,17 @@ def _performance_slice(
         "request_preprocess_latency_ms": _latency_summary(
             [float(request["preprocess_seconds"]) for request in requests]
         ),
-        "request_engine_latency_ms": _optional_latency_summary(
-            [request.get("engine_request_seconds") for request in requests]
+        "request_queue_latency_ms": _optional_latency_summary(
+            [request.get("queue_seconds") for request in requests]
+        ),
+        "request_prefill_latency_ms": _optional_latency_summary(
+            [request.get("prefill_seconds") for request in requests]
+        ),
+        "request_decode_latency_ms": _optional_latency_summary(
+            [request.get("decode_seconds") for request in requests]
+        ),
+        "request_engine_inference_latency_ms": _optional_latency_summary(
+            [request.get("engine_inference_seconds") for request in requests]
         ),
         "batch_engine_latency_ms": _latency_summary(
             [float(batch["engine_seconds"]) for batch in batches]
