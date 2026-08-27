@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import copy
 import unittest
+from pathlib import Path
+
+import yaml
 
 from tests.helpers import complete_config
 from omni_sd.config import ConfigError, validate_config
@@ -9,6 +12,26 @@ from omni_sd.ascend_runtime import runtime_identity
 
 
 class ConfigTests(unittest.TestCase):
+    def test_production_defaults_preserve_original_omni_sampling_contract(self):
+        root = Path(__file__).resolve().parents[1]
+        config = yaml.safe_load(
+            (root / "configs/generate_thinker_data.yaml").read_text(encoding="utf-8")
+        )
+        generation = config["generation"]
+        self.assertTrue(generation["do_sample"])
+        self.assertEqual(generation["temperature"], 0.7)
+        self.assertEqual(generation["top_p"], 0.8)
+        self.assertEqual(generation["top_k"], 20)
+        self.assertEqual(generation["repetition_penalty"], 1.0)
+        self.assertEqual(generation["max_new_tokens"], 2048)
+        self.assertEqual(generation["eos_token_id"], 151645)
+        self.assertTrue(generation["use_audio_in_video"])
+        self.assertEqual(config["hidden_states"]["layer_ids"], [1, 12, 24, 36, 47])
+        self.assertEqual(config["hidden_states"]["num_target_layers"], 48)
+        self.assertTrue(
+            config["hidden_states"]["require_final_normalized_hidden"]
+        )
+
     def test_complete_config_is_valid(self):
         validated = validate_config(complete_config())
         self.assertEqual(validated["runtime"]["tensor_parallel_size"], 4)

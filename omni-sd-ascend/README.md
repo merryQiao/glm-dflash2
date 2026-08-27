@@ -12,6 +12,21 @@ Talker and Code2Wav are deliberately not loaded.
 3. Every output shard is atomic and content-addressed. Resume rejects mixed
    model revisions, runtime settings, sampling policies, and corrupt files.
 
+### Fidelity to `omni-sd(3)`
+
+The Ascend path retains the original accepted-condition schema, Qwen chat
+template and multimodal processor, sampling profile (`0.7/0.8/top-20`), EOS,
+exact engine token IDs, and two-pass response-then-hidden workflow. The target
+layers remain `[1, 12, 24, 36, 47]`. Three changes are intentional:
+
+- CUDA/Transformers replicas are replaced by one vLLM-Ascend TP/EP engine;
+- sampling seed is condition-local rather than batch-local, so changing batch
+  composition cannot change the saved supervision target;
+- the raw final decoder state is explicitly RMS-normalized with the immutable
+  checkpoint weight before being labeled as lm-head input.
+
+Contract tests pin these settings and fail if they drift.
+
 ## Runtime baseline
 
 Use an official Qwen3-Omni-capable vLLM-Ascend image, currently:
@@ -109,6 +124,49 @@ For multiple independent engines, expose disjoint chip sets and assign shards
 with `WORKER_ID=0..N-1` and `NUM_WORKERS=N`. Each process still owns its own
 complete TP group.
 
+## Thinker inference performance
+
+`inference_qwen3-omni.py` profiles the same Thinker-only path used by Stage A.
+It calls the same `load_engine`, `prepare_request`, and `sampling_kwargs`
+provider, so it does not silently switch to greedy decoding or to a separate
+Transformers implementation. Talker and Code2Wav are intentionally excluded.
+
+Validate the exact engine and sampling plan without importing vLLM or
+allocating a model:
+
+```bash
+python inference_qwen3-omni.py \
+  --config configs/generate_thinker_data.yaml \
+  --text "Describe speculative decoding." \
+  --dry-run \
+  --profile-json outputs/thinker_dry_run.json
+```
+
+Run a real A2 profile. The warmup call is excluded from every throughput and
+latency aggregate:
+
+```bash
+ASCEND_HARDWARE=a2 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+TP_SIZE=4 \
+CONFIG=$PWD/configs/generate_thinker_data.yaml \
+bash scripts/profile_thinker_ascend.sh \
+  --conditions-parquet /path/to/accepted_conditions.parquet \
+  --limit 128 \
+  --warmup 1 \
+  --output-jsonl outputs/thinker_profile.jsonl \
+  --profile-json outputs/thinker_profile.json
+```
+
+For a short functional run, use `--text`; for representative throughput, use
+accepted-condition Parquet and retain the configured modality-specific batch
+sizes. `--batch-size N` intentionally overrides every modality batch size and
+is recorded only by the performance invocation, not the training manifest.
+The profile reports model-load and warmup time separately, measured wall time,
+request latency percentiles, requests/s, completion-token TPS, and total-token
+TPS. Exact prompt and response token IDs are written for every measured
+request.
+
 ## Hard runtime gate
 
 CPU contract tests pass without Ascend hardware, but that does **not** prove
@@ -129,6 +187,6 @@ retokenized responses or mislabeled final hidden states.
 
 ```bash
 python -m pytest -q
-python -m py_compile $(find src scripts/data -name '*.py' -type f)
+python -m py_compile inference_qwen3-omni.py $(find src scripts/data -name '*.py' -type f)
 for script in scripts/*.sh; do bash -n "$script"; done
 ```
