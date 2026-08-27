@@ -147,7 +147,9 @@ python inference_qwen3-omni.py \
 ```
 
 Run a real A2 profile. The warmup call is excluded from every throughput and
-latency aggregate:
+latency aggregate. HBM telemetry is required by default and is collected from
+every vLLM TP worker through `LLM.collective_rpc` and the rank-local
+`torch_npu` allocator:
 
 ```bash
 ASCEND_HARDWARE=a2 \
@@ -166,10 +168,53 @@ For a short functional run, use `--text`; for representative throughput, use
 accepted-condition Parquet and retain the configured modality-specific batch
 sizes. `--batch-size N` intentionally overrides every modality batch size and
 is recorded only by the performance invocation, not the training manifest.
-The profile reports model-load and warmup time separately, measured wall time,
-request latency percentiles, requests/s, completion-token TPS, and total-token
-TPS. Exact prompt and response token IDs are written for every measured
-request.
+The profile separates host preprocessing, the enclosing `LLM.generate` call,
+and outer end-to-end batch time. It reports engine-only and end-to-end
+requests/s, completion-token TPS, and total-token TPS; per-request
+preprocessing latency; vLLM request latency only when vLLM exposes valid
+arrival/finish timestamps; and batch engine/end-to-end distributions. The
+same report is repeated under `performance.by_modality` using modality-local
+time denominators. Exact prompt and response token IDs are written for every
+measured request.
+
+Every successful real run publishes three files: the JSONL, the profile JSON,
+and `<profile>.SUCCESS.json`. The success marker is written last and binds the
+other two files by SHA-256. Treat files without this marker as incomplete.
+
+The `memory` section contains per-rank current and peak allocated/reserved HBM,
+plus precisely named TP reductions. These are `torch_npu_allocator` values,
+not device-wide `npu-smi` usage. If the pinned vLLM build cannot execute worker
+RPC, the profiler fails. `--allow-missing-hbm` is an explicit diagnostic-only
+opt-out and makes the entire memory section unavailable; partial-rank numbers
+are never reported.
+
+Benchmark scoring is opt-in for JSONL input. Add one frozen scorer contract per
+row:
+
+```json
+{
+  "id": "example",
+  "text": "Answer with one letter.",
+  "evaluation": {
+    "metric": "multiple_choice_accuracy",
+    "reference": "B"
+  }
+}
+```
+
+Supported `omni_eval_v1` metrics are `exact_match`,
+`normalized_exact_match`, and `multiple_choice_accuracy`. A run cannot mix
+metric names. The report gives evaluated/skipped counts and accuracy overall
+and by modality; rows without references are skipped rather than scored as
+wrong.
+
+`components` distinguishes `loaded`, `executed`, and `timing_available`.
+Audio/Vision Encoder and Thinker internal device-event times are not exposed by
+the current vLLM-Ascend route. Talker, MTP/code predictor, and Code2Wav are not
+loaded. Their timings are explicitly unavailable, never approximated or
+reported as zero. The profile remains the same Thinker-only vLLM path that a
+future drafter adapter must accelerate; no native/Transformers fallback is
+used.
 
 ## Hard runtime gate
 

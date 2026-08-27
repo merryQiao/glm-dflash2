@@ -33,8 +33,11 @@ Stage B 是 teacher forcing，不再采样，不允许由文本重新 tokenize �
 - text/image/audio/video accepted-condition 数据契约；
 - A2/A3 launcher 和 `ASCEND_SMOKE_ATTESTATION.json` 验收入口；
 - `inference_qwen3-omni.py` Thinker-only 性能入口，复用 Stage A 的 engine、
-  processor、request builder 和 sampling provider；
-- 31 项 CPU 契约测试通过。
+  processor、request builder 和 sampling provider；它已经补齐 preprocess / engine /
+  end-to-end 三套时间、按模态汇总、可选 benchmark scorer、TP worker HBM、组件可用性和
+  checksum success marker；
+- CPU fake-engine 契约测试覆盖准确计时、精确 token IDs、scorer、HBM RPC/reduction 和
+  原子发布。
 
 上述证明代码契约，**不证明**目标 vLLM-Ascend 镜像的 NPU kernel、
 multimodal hidden connector 和 layer-48 语义已经通过实机验收。
@@ -118,8 +121,22 @@ bash scripts/profile_thinker_ascend.sh \
 ```
 
 性能报告只包含 Thinker；必须报告 model-load/warmup 时间、实测 wall time、
-request/s、completion-token TPS、total-token TPS 和 latency percentiles。不要把 dry-run
-的 plan JSON 当成性能结果。
+engine-only 与 end-to-end 的 request/s、completion-token TPS、total-token TPS、按模态
+latency/throughput，以及每个 TP worker 的 `torch_npu_allocator` HBM。默认缺 HBM 即失败；
+`--allow-missing-hbm` 只允许用于诊断，不能用于正式表格。不要把 dry-run 的 plan JSON
+当成性能结果，也不要把 batch latency 复制成每个 request 的 latency。
+
+正式结果必须同时存在 JSONL、profile JSON 和 `<profile>.SUCCESS.json`，且 marker 中
+两个 SHA-256 与文件一致。Audio/Vision Encoder/Thinker 的内部 event timing 当前不可观测；
+Talker、MTP/code predictor、Code2Wav 没有加载。profile 会明确记录 unavailable，不得填 0。
+
+若需要 benchmark accuracy，使用 JSONL 输入并为每条样本增加：
+
+```json
+{"evaluation":{"metric":"normalized_exact_match","reference":"expected"}}
+```
+
+同一次运行只能使用一种 `omni_eval_v1` metric；无 reference 的样本计入 skipped。
 
 ## 5. 目标机上仍需关闭的阻点
 
@@ -131,6 +148,9 @@ request/s、completion-token TPS、total-token TPS 和 latency percentiles。不
 4. 确认 connector 实际输出 layout 为 `[tokens,layers,hidden]`；不得只凭 shape
    猜测 layer 轴。
 5. 在正式数据量上验证长序列 HBM、scratch 盘、atomic rename 和 resume。
+6. profile 实机 gate 必须包含 text、single-image、multi-image、audio、video、mixed
+   各至少一条；确认 worker RPC 返回完整且物理 NPU 唯一的 TP ranks，HBM 值 finite，
+   每种实际 payload 均进入对应 `performance.by_modality`，最后生成 success marker。
 
 任一项失败时应修正目标 runtime 的 connector/adapter，不允许退化为文本重
 tokenize、Transformers 第二份 target 副本，或未归一化的 final hidden。

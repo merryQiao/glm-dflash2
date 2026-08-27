@@ -80,7 +80,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-json", type=Path)
     parser.add_argument("--success-marker", type=Path)
     parser.add_argument("--allow-missing-hbm", action="store_true")
-    parser.add_argument("--variant-manifest", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -313,29 +312,6 @@ def write_profile_bundle(
             backup.unlink(missing_ok=True)
 
 
-def _variant_identity(path: Path | None) -> dict[str, Any]:
-    if path is None:
-        return {"kind": "target_only"}
-    value = json.loads(path.read_text(encoding="utf-8"))
-    required = {
-        "kind",
-        "method",
-        "drafter_artifact_digest",
-        "adapter_version",
-        "speculative_config",
-    }
-    if not isinstance(value, dict) or set(value).difference(required):
-        raise ProfileContractError("variant manifest contains unsupported fields")
-    missing = required.difference(value)
-    if missing or value.get("kind") != "speculative":
-        raise ProfileContractError(
-            f"invalid speculative variant manifest; missing={sorted(missing)}"
-        )
-    if not isinstance(value["speculative_config"], dict):
-        raise ProfileContractError("speculative_config must be a mapping")
-    return {key: value[key] for key in sorted(required)}
-
-
 def _media_inventory(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     inventory: list[dict[str, Any]] = []
     for row in rows:
@@ -418,6 +394,11 @@ def _comparison_identity(
         "contract": payload["contract"],
         "fingerprint": stable_hex(payload),
         "measurement_rounds": 1,
+        "artifact_binding": "declared_model_and_processor_revisions",
+        "strict_artifact_manifest_available": False,
+        "strict_artifact_manifest_reason": (
+            "no immutable file-level model artifact manifest was supplied"
+        ),
     }
 
 
@@ -445,7 +426,6 @@ def run_profile(
     warmup: int,
     *,
     allow_missing_hbm: bool = False,
-    variant_manifest: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     validate_evaluation_contract(rows)
     identity = runtime_identity(hardware=str(config["runtime"]["hardware"]))
@@ -461,7 +441,6 @@ def run_profile(
         warmup=warmup,
         runtime=identity,
     )
-    variant_identity = _variant_identity(variant_manifest)
 
     load_started = time.perf_counter()
     llm, processor, sampling_params_class = load_engine(config)
@@ -595,7 +574,7 @@ def run_profile(
         "engine": engine_kwargs(config),
         "runtime": identity,
         "comparison_identity": comparison_identity,
-        "variant_identity": variant_identity,
+        "variant_identity": {"kind": "target_only"},
         "performance": performance,
         "memory": memory,
         "evaluation": evaluation,
@@ -663,7 +642,6 @@ def main() -> None:
             sizes,
             args.warmup,
             allow_missing_hbm=args.allow_missing_hbm,
-            variant_manifest=args.variant_manifest,
         )
         write_profile_bundle(
             output_jsonl=args.output_jsonl,

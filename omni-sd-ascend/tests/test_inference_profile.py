@@ -694,27 +694,6 @@ def test_comparison_identity_binds_local_media_bytes(tmp_path: Path):
     assert first["fingerprint"] != second["fingerprint"]
 
 
-def test_variant_manifest_is_structured_and_does_not_change_engine(tmp_path: Path):
-    cli = _load_inference_cli()
-    manifest = tmp_path / "variant.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "kind": "speculative",
-                "method": "dflash2",
-                "drafter_artifact_digest": "sha256:abc",
-                "adapter_version": "v1",
-                "speculative_config": {"num_speculative_tokens": 7},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert cli._variant_identity(None) == {"kind": "target_only"}
-    assert cli._variant_identity(manifest)["method"] == "dflash2"
-    assert engine_kwargs(complete_config()) == engine_kwargs(complete_config())
-
-
 def test_profile_bundle_publishes_checksum_marker_last(tmp_path: Path):
     cli = _load_inference_cli()
     output = tmp_path / "records.jsonl"
