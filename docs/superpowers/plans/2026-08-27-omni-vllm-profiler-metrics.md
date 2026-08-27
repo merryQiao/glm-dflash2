@@ -60,7 +60,8 @@ Use all six actual payload classes (`text`, `image`, `multi_image`, `audio`,
 `video`, `other`) and unequal batch times. Assert request/completion/total
 counts, engine/e2e request/completion/total TPS, per-request preprocessing and
 optional engine latency distributions, per-batch engine/e2e distributions,
-and modality-local denominators.
+and modality-local denominators. Preserve the existing
+`completion_tokens_per_second` name and prove it remains engine-only TPS.
 
 - [ ] **Step 5: Run aggregation tests and verify RED**
 
@@ -100,6 +101,8 @@ git commit -m "feat: add omni profile metric contracts"
 - [ ] **Step 1: Write failing HBM worker/reduction tests**
 
 Test exact TP rank count, unique physical devices, per-batch peak reset/snapshot records, `final_current`, `max_post_batch_current`, per-rank maxima, and `max_batch_sum_of_rank_peaks`. Test missing/duplicate ranks fail and `allow_missing` makes the entire section unavailable.
+Assert every available memory report declares
+`source: "torch_npu_allocator"`.
 
 - [ ] **Step 2: Run HBM tests and verify RED**
 
@@ -133,7 +136,10 @@ git commit -m "feat: collect vllm worker hbm metrics"
 Use an injected monotonic clock and fake `collective_rpc`. Assert warmup is
 excluded; measured preprocessing/engine/e2e clocks are distinct; exact IDs
 remain intact; modality, evaluation result, batch timings, HBM, components,
-and workload/variant identities appear in the final report.
+and workload/variant identities appear in the final report. Assert each JSONL
+row itself contains evaluation metadata/result, its own preprocessing latency,
+optional vLLM request engine latency, and its enclosing batch engine/e2e
+latency.
 
 - [ ] **Step 2: Run integration tests and verify RED**
 
@@ -153,14 +159,24 @@ engine or sampling kwargs.
 Hash normalized rows/order/batches, per-request seeds, warmup, actual local
 media bytes and sizes, scorer/metric/reference data, full non-speculative
 engine/runtime/topology/software identity, and model/processor artifact
-manifests. Reject unfrozen remote media for strict identity. Tests change each
-bound field one at a time and require a different fingerprint.
+manifests plus measurement rounds. Reject unfrozen remote media for strict
+identity. Tests change each bound field one at a time and require a different
+fingerprint.
 
-- [ ] **Step 5: Add atomic-output failure test and implementation**
+- [ ] **Step 5: Add failure-order and production-route regression tests**
+
+Prove malformed arguments/input/evaluation fail before `load_engine`, and
+missing outputs, empty completions, or output/request count mismatch fail
+without final artifacts. Monkeypatch only the imported production providers
+and assert the CLI still invokes `prepare_request` and `sampling_kwargs` with
+the unchanged config/condition IDs; assert `engine_kwargs` and sampling kwargs
+remain identical to Stage A.
+
+- [ ] **Step 6: Add atomic-output failure test and implementation**
 
 Prove a failure leaves no final JSONL/profile/success marker. On success atomically rename both files and write a checksum-bound success marker last.
 
-- [ ] **Step 6: Run complete profiler tests**
+- [ ] **Step 7: Run complete profiler tests**
 
 ```bash
 "$PY" -m pytest -q omni-sd-ascend/tests/test_inference_profile.py \
@@ -169,7 +185,7 @@ Prove a failure leaves no final JSONL/profile/success marker. On success atomica
 
 Expected: all pass.
 
-- [ ] **Step 7: Commit Task 3**
+- [ ] **Step 8: Commit Task 3**
 
 ```bash
 git add omni-sd-ascend/inference_qwen3-omni.py \
