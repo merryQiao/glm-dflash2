@@ -86,7 +86,8 @@ hidden_states:
   require_final_normalized_hidden: true
   # vLLM exposes layer 48 as the raw post-decoder/pre-final-norm state. The
   # pipeline loads this exact checkpoint weight and applies the official RMSNorm
-  # formula offline, then parity-checks it against a reference Thinker forward.
+  # formula offline. The hardware smoke checks exact replay tokens, tensor shape,
+  # finite values, and the explicit final-normalized cache semantics.
   final_norm_weight_key: thinker.model.norm.weight
   final_norm_epsilon: 1.0e-6
   max_shard_bytes: 4294967296
