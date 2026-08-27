@@ -1,5 +1,7 @@
 data/vibe_coding_630k/processed/
 outputs/
 .worktrees/
+.pytest_cache/
+.DS_Store
 *.pyc
 __pycache__/

@@ -16,9 +16,9 @@ Talker and Code2Wav are deliberately not loaded.
 3. Every output shard is atomic and content-addressed. Resume rejects mixed
    model revisions, runtime settings, sampling policies, and corrupt files.
 
-### Fidelity to `omni-sd(3)`
+### Fidelity to the source Omni pipeline
 
-The Ascend path retains the original accepted-condition schema, Qwen chat
+The Ascend path retains the source pipeline's accepted-condition schema, Qwen chat
 template and multimodal processor, sampling profile (`0.7/0.8/top-20`), EOS,
 exact engine token IDs, and two-pass response-then-hidden workflow. The target
 layers remain `[1, 12, 24, 36, 47]`. Three changes are intentional:
