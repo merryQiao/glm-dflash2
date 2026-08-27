@@ -168,11 +168,17 @@ engine/end-to-end latency, and evaluation metadata/result when requested.
 Each profile separates two identities:
 
 - `comparison_invariant_fingerprint`: target and processor revisions,
-  vLLM/vLLM-Ascend versions, hardware and TP/EP topology, normalized request
-  content and order, computed batch boundaries, sampling parameters,
+  an actual artifact-manifest digest over all model/processor files,
+  vLLM/vLLM-Ascend/CANN/torch/torch-npu build identities, dtype and
+  quantization, hardware and TP/EP topology, every non-speculative engine
+  option (including model length, sequence and batched-token limits,
+  scheduler, prefix cache, chunked prefill, and graph/eager mode), normalized
+  request content and order, computed batch boundaries, sampling parameters,
   per-request seeds, warmup, and measurement rounds. Local media are bound by
-  content digest and size, not path alone. When evaluation is enabled, this
-  also binds scorer version, metric, and reference digest.
+  content digest and size, not path alone. Strict pairing rejects remote media
+  unless it is first materialized and the actual fetched bytes are frozen and
+  hashed. When evaluation is enabled, the invariant also binds scorer version,
+  metric, and reference digest.
 - `variant_identity`: `target_only` or the exact speculative method, drafter
   export digest, adapter version, and speculative configuration.
 
@@ -186,12 +192,13 @@ sampled token content can change context and MoE routing even at equal length.
 If identical sampled paths cannot be reproduced, each variant may report its
 independent throughput distribution, but paired speedup is ineligible.
 
-Paired measurements run on exclusive identical devices for at least three
-rounds. Execution order alternates target/speculative then
-speculative/target, with the same warmup policy before each variant. The report
-stores every round's engine and end-to-end speedup and summarizes them with
-median, median absolute deviation, minimum, and maximum; it never reports only
-one ratio of grand totals.
+Paired measurements run on exclusive identical devices for an even number of
+rounds, at least four. A balanced ABBA order gives each variant the same number
+of first and second executions, with the same warmup policy before each
+variant. For both engine and end-to-end clocks, per-round speedup is frozen as
+`baseline_elapsed / speculative_elapsed` (larger is faster). The report stores
+every round and summarizes them with median, median absolute deviation,
+minimum, and maximum; it never reports only one ratio of grand totals.
 
 ## Failure policy
 
