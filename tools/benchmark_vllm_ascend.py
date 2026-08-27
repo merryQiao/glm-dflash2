@@ -27,6 +27,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--seed", type=int, default=42)
     run.add_argument("--warmup-requests", type=int, default=2)
     run.add_argument("--timeout", type=float, default=1800.0)
+    run.add_argument("--rejection-mode", choices=("none", "standard"), default="none")
     compare = sub.add_parser("compare")
     compare.add_argument("--baseline", required=True)
     compare.add_argument("--speculative", required=True)
@@ -49,6 +50,7 @@ def main() -> int:
             seed=args.seed,
             warmup_requests=args.warmup_requests,
             timeout=args.timeout,
+            rejection_mode=args.rejection_mode,
         )
     else:
         baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))

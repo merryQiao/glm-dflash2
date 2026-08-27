@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from tools.train_dflash2_offline import build_parser
-from tools.train_drafter_offline import resolve_method_recipe
+from tools.train_drafter_offline import build_parser, resolve_method_recipe
 
 
 class TrainCliTest(unittest.TestCase):
     def test_fixed_training_defaults_and_no_target_backbone_argument(self):
-        parser = build_parser()
+        parser = build_parser(default_method="dflash2")
         destinations = {action.dest for action in parser._actions}
         self.assertNotIn("target_model", destinations)
         args = resolve_method_recipe(parser.parse_args(
@@ -34,7 +33,7 @@ class TrainCliTest(unittest.TestCase):
         self.assertTrue(args.fsdp2)
 
     def test_rejects_mutating_fixed_architecture(self):
-        parser = build_parser()
+        parser = build_parser(default_method="dflash2")
         with self.assertRaises(SystemExit):
             parser.parse_args(
                 [

@@ -13,6 +13,7 @@ from glm_dflash2.sglang_hidden_runner import (
     SGLangInternalHiddenRunner,
     initialize_forward_batch,
     req_token_array,
+    validate_stage_b_server_args,
 )
 
 
@@ -37,6 +38,51 @@ class FakeGlmModel:
 
 
 class SGLangHiddenRunnerTest(unittest.TestCase):
+    @staticmethod
+    def _server_args(**overrides):
+        values = {
+            "tp_size": 16,
+            "ep_size": 16,
+            "pp_size": 1,
+            "dp_size": 1,
+            "nnodes": 1,
+            "node_rank": 0,
+            "chunked_prefill_size": -1,
+            "disable_radix_cache": True,
+            "disable_cuda_graph": True,
+            "max_running_requests": 1,
+            "device": "npu",
+            "attention_backend": "ascend",
+            "dtype": "bfloat16",
+            "model_runner": "torch",
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_stage_b_contract_accepts_strict_single_request_torch_runner(self):
+        contract = validate_stage_b_server_args(self._server_args())
+        self.assertEqual(contract["model_runner"], "torch")
+        self.assertEqual(contract["capture_mode"], "FULL")
+        self.assertTrue(contract["disable_cuda_graph"])
+        self.assertTrue(contract["disable_radix_cache"])
+        self.assertEqual(contract["chunked_prefill_size"], -1)
+        self.assertEqual(contract["max_running_requests"], 1)
+
+    def test_stage_b_contract_rejects_unsafe_execution_settings(self):
+        invalid = (
+            ("dp_size", 2, "DP=1"),
+            ("pp_size", 2, "PP=1"),
+            ("chunked_prefill_size", 4096, "chunked prefill"),
+            ("disable_radix_cache", False, "radix/prefix cache"),
+            ("disable_cuda_graph", False, "graphs"),
+            ("max_running_requests", 2, "one request"),
+            ("model_runner", "unknown", "Model Runner"),
+        )
+        for field, value, pattern in invalid:
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    validate_stage_b_server_args(self._server_args(**{field: value}))
+
     def test_req_token_array_uses_sglang_signed_int64_contract(self):
         value = req_token_array([1, 2, 2**40])
         self.assertEqual(value.typecode, "q")
@@ -109,13 +155,7 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
             "sglang.benchmark": benchmark,
             "sglang.benchmark.one_batch": one_batch,
         }
-        server_args = SimpleNamespace(
-            tp_size=16,
-            ep_size=16,
-            pp_size=1,
-            dp_size=1,
-            chunked_prefill_size=-1,
-        )
+        server_args = self._server_args()
         with patch.dict(sys.modules, modules):
             runner = SGLangInternalHiddenRunner(
                 server_args=server_args,
@@ -128,6 +168,12 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
         self.assertEqual(runner.physical_layer_ids, (2, 21, 39, 57, 76))
         self.assertEqual(runner.hidden_size, 6144)
         self.assertEqual(runner.backend_metadata["sglang_version"], "fake-version")
+        self.assertEqual(runner.backend_metadata["model_runner"], "torch")
+        self.assertEqual(runner.backend_metadata["dtype"], "bfloat16")
+        self.assertEqual(runner.backend_metadata["device_type"], "npu")
+        self.assertEqual(runner.backend_metadata["attention_backend"], "ascend")
+        self.assertEqual(runner.backend_metadata["logical_layer_ids"], [1, 20, 38, 56, 75])
+        self.assertEqual(runner.backend_metadata["physical_layer_ids"], [2, 21, 39, 57, 76])
         self.assertEqual(
             runner.capture_mapping[0].concrete_tap,
             "model.model.layers_to_capture[2]",
@@ -148,13 +194,7 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
         sglang = types.ModuleType("sglang")
         sglang.__path__ = []
         modules = {"sglang": sglang, "sglang.bench_one_batch": one_batch}
-        server_args = SimpleNamespace(
-            tp_size=16,
-            ep_size=16,
-            pp_size=1,
-            dp_size=1,
-            chunked_prefill_size=-1,
-        )
+        server_args = self._server_args()
         with patch.dict(sys.modules, modules):
             with self.assertRaisesRegex(ValueError, "ordered logical layers"):
                 SGLangInternalHiddenRunner(
@@ -179,13 +219,7 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
             "sglang": sglang,
             "sglang.bench_one_batch": one_batch,
         }
-        server_args = SimpleNamespace(
-            tp_size=16,
-            ep_size=16,
-            pp_size=1,
-            dp_size=1,
-            chunked_prefill_size=-1,
-        )
+        server_args = self._server_args()
         with patch.dict(sys.modules, modules):
             runner = SGLangInternalHiddenRunner(
                 server_args=server_args,
@@ -209,9 +243,7 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
         sglang = types.ModuleType("sglang")
         sglang.__path__ = []
         modules = {"sglang": sglang, "sglang.bench_one_batch": one_batch}
-        server_args = SimpleNamespace(
-            tp_size=32, ep_size=32, pp_size=1, dp_size=1, chunked_prefill_size=-1
-        )
+        server_args = self._server_args(tp_size=32, ep_size=32)
         with patch.dict(sys.modules, modules):
             runner = SGLangInternalHiddenRunner(
                 server_args=server_args,
@@ -234,9 +266,7 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
         sglang = types.ModuleType("sglang")
         sglang.__path__ = []
         modules = {"sglang": sglang, "sglang.bench_one_batch": one_batch}
-        server_args = SimpleNamespace(
-            tp_size=1, ep_size=1, pp_size=1, dp_size=1, chunked_prefill_size=-1
-        )
+        server_args = self._server_args(tp_size=1, ep_size=1)
         with patch.dict(sys.modules, modules):
             runner = SGLangInternalHiddenRunner(
                 server_args=server_args,
@@ -262,9 +292,7 @@ class SGLangHiddenRunnerTest(unittest.TestCase):
         sglang = types.ModuleType("sglang")
         sglang.__path__ = []
         modules = {"sglang": sglang, "sglang.bench_one_batch": one_batch}
-        server_args = SimpleNamespace(
-            tp_size=1, ep_size=1, pp_size=1, dp_size=1, chunked_prefill_size=-1
-        )
+        server_args = self._server_args(tp_size=1, ep_size=1)
         with patch.dict(sys.modules, modules):
             runner = SGLangInternalHiddenRunner(
                 server_args=server_args,

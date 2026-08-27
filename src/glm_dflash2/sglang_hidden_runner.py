@@ -3,7 +3,10 @@ from __future__ import annotations
 from array import array
 from collections.abc import Sequence
 import importlib
+import importlib.metadata
 import inspect
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -12,6 +15,77 @@ from .hidden_capture import CaptureTap, TargetHiddenCapture
 
 
 GLM52_DFLASH_LOGICAL_LAYERS = (1, 20, 38, 56, 75)
+
+
+def _server_value(server_args: Any, name: str, default: Any = None) -> Any:
+    value = getattr(server_args, name, default)
+    return value.value if hasattr(value, "value") else value
+
+
+def validate_stage_b_server_args(server_args: Any) -> dict[str, Any]:
+    """Validate the deterministic hidden-replay contract before model allocation."""
+
+    if int(_server_value(server_args, "dp_size", 1)) != 1:
+        raise ValueError("Stage B hidden replay requires DP=1")
+    if int(_server_value(server_args, "pp_size", 1)) != 1:
+        raise ValueError("Stage B hidden replay requires PP=1")
+    if int(_server_value(server_args, "chunked_prefill_size", -1)) != -1:
+        raise ValueError("Stage B hidden replay requires chunked prefill to be disabled")
+    if not bool(_server_value(server_args, "disable_radix_cache", False)):
+        raise ValueError("Stage B hidden replay requires radix/prefix cache to be disabled")
+    if not bool(_server_value(server_args, "disable_cuda_graph", False)):
+        raise ValueError("Stage B hidden replay requires execution graphs to be disabled")
+    if int(_server_value(server_args, "max_running_requests", 1)) != 1:
+        raise ValueError("Stage B hidden replay supports exactly one request at a time")
+    model_runner = str(
+        _server_value(
+            server_args,
+            "model_runner",
+            _server_value(server_args, "model_impl", "torch"),
+        )
+    ).lower()
+    if model_runner not in {"torch", "pytorch", "auto"}:
+        raise ValueError(
+            f"unsupported SGLang Model Runner {model_runner!r}; use the PyTorch runner"
+        )
+    return {
+        "model_runner": model_runner,
+        "capture_mode": "FULL",
+        "disable_cuda_graph": True,
+        "disable_radix_cache": True,
+        "chunked_prefill_size": -1,
+        "max_running_requests": 1,
+        "device_type": str(_server_value(server_args, "device", "unknown")),
+        "attention_backend": str(
+            _server_value(server_args, "attention_backend", "unknown")
+        ),
+        "dtype": str(_server_value(server_args, "dtype", "unknown")),
+        "tp_size": int(_server_value(server_args, "tp_size", 1)),
+        "ep_size": int(_server_value(server_args, "ep_size", 1)),
+        "pp_size": 1,
+        "dp_size": 1,
+        "nnodes": int(_server_value(server_args, "nnodes", 1)),
+        "node_rank": int(_server_value(server_args, "node_rank", 0)),
+    }
+
+
+def _distribution_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
+
+
+def _cann_identity() -> dict[str, str]:
+    home = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_TOOLKIT_HOME")
+    version = os.environ.get("ASCEND_TOOLKIT_VERSION", "unknown")
+    if home:
+        for relative in ("version.info", "ascend_toolkit_install.info"):
+            path = Path(home) / relative
+            if path.is_file():
+                version = path.read_text(encoding="utf-8", errors="replace").strip()
+                break
+    return {"cann_home": home or "unknown", "cann_version": version}
 
 
 def req_token_array(input_ids: Sequence[int]) -> array:
@@ -68,6 +142,7 @@ class SGLangInternalHiddenRunner:
         tp_rank: int,
         logical_layer_ids: Sequence[int],
     ) -> None:
+        contract = validate_stage_b_server_args(server_args)
         one_batch = one_batch_module()
         wrapped, self.tokenizer = one_batch.load_model(
             server_args, port_args, gpu_id, tp_rank
@@ -135,14 +210,15 @@ class SGLangInternalHiddenRunner:
         self.backend_metadata = {
             "backend": "sglang_internal_model_runner",
             "sglang_version": version,
+            "torch_version": str(torch.__version__),
+            "torch_npu_version": _distribution_version("torch-npu"),
+            **_cann_identity(),
             "model_class": type(model).__name__,
-            "tp_size": int(server_args.tp_size),
-            "ep_size": int(server_args.ep_size),
-            "pp_size": int(server_args.pp_size),
-            "dp_size": int(server_args.dp_size),
-            "chunked_prefill_size": int(server_args.chunked_prefill_size),
-            "capture_mode": "FULL",
+            "runner_class": type(self._runner).__name__,
+            **contract,
             "capture_hook": capture_hook,
+            "logical_layer_ids": list(self.logical_layer_ids),
+            "physical_layer_ids": list(self.physical_layer_ids),
             "capture_mapping": [tap.as_tuple() for tap in self.capture_mapping],
             "final_hidden_tap": self.final_hidden_tap,
             "final_hidden_semantics": "post_final_norm_lm_head_input",

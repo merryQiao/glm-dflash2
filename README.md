@@ -36,11 +36,17 @@ commands and hardware gates.
    streams and post-final-norm LM-head input together.
 3. **Target token I/O extraction.** Dense BF16/FP16/FP32
    `embed_tokens.weight` and `lm_head.weight` are extracted once and frozen.
-4. **Offline training and deployment export.** All methods use the same cache
-   rows, stable sample IDs, deterministic anchors, common backbone,
-   optimizer/checkpoint framework and absolute-position contract. The final
-   `export/` combines the trained draft with the frozen target embedding and
-   LM head required by a serving runtime.
+4. **Offline training.** All methods use the same cache rows, stable sample
+   IDs, deterministic anchors, common backbone, optimizer/checkpoint framework
+   and absolute-position contract.
+5. **Method-specific candidate export and runtime attestation.** DFlash,
+   DFlash2 and DSpark are exported through separate adapters. A fresh export is
+   deliberately marked `candidate-not-deployable`; only tensor-by-tensor parity
+   on one exact vLLM/vLLM-Ascend/Speculators/CANN runtime may create a
+   `runtime-attested` artifact.
+6. **Formal vLLM-Ascend evaluation.** Target-only and speculative servers run
+   serially on the same hardware. Greedy uses raw-token equality and sampling
+   uses standard rejection sampling; speculative counters must be positive.
 
 Stage A and Stage B intentionally run separately so two 753B target replicas
 are never resident simultaneously. The frozen sampled path is teacher-forced;
@@ -123,7 +129,7 @@ WORKSPACE_MAP=/shared/data/workspace_map.jsonl \
 WORKSPACE_CACHE=/shared/cache/vibe-workspaces \
 OPEN_SWE_STORE=/shared/data/open_swe_original.sqlite \
 OUTPUT_JSONL=/shared/out/trajectories-shard-0-of-1.jsonl \
-bash scripts/run_stage_a_trajectories.sh
+bash scripts/generate_trajectories.sh
 ```
 
 Stage A defaults to `WORKERS=8` trajectory workers but permits only
@@ -140,7 +146,7 @@ Start conservatively on a new Ascend deployment:
 
 ```bash
 WORKERS=4 MAX_RUNNING_REQUESTS=1 MAX_TOTAL_TOKENS=131072 \
-MAX_SAMPLES=50 ... bash scripts/run_stage_a_trajectories.sh
+MAX_SAMPLES=50 ... bash scripts/generate_trajectories.sh
 ```
 
 Then use the default `8/2` profile only after checking peak HBM. Do not copy
@@ -201,8 +207,8 @@ command. Container execution remains sandboxed; host tests are disabled unless
 Independent full model replicas can data-shard by stable selected-row index:
 
 ```bash
-DATA_SHARD_COUNT=2 DATA_SHARD_INDEX=0 ... bash scripts/run_stage_a_trajectories.sh
-DATA_SHARD_COUNT=2 DATA_SHARD_INDEX=1 ... bash scripts/run_stage_a_trajectories.sh
+DATA_SHARD_COUNT=2 DATA_SHARD_INDEX=0 ... bash scripts/generate_trajectories.sh
+DATA_SHARD_COUNT=2 DATA_SHARD_INDEX=1 ... bash scripts/generate_trajectories.sh
 ```
 
 Without `ENDPOINT`, the script launches a temporary local SGLang server using
@@ -226,7 +232,7 @@ TRAJECTORY_JSONL=/shared/out/trajectories.jsonl \
 OUTPUT_DIR=/shared/out/hidden-v2 \
 TP_SIZE=32 EP_SIZE=32 NNODES=2 NODE_RANK=0 \
 DIST_INIT_ADDR=<rank-0-host> NCCL_PORT=29500 \
-bash scripts/run_stage_b_hidden.sh
+bash scripts/extract_hidden_sglang.sh
 ```
 
 Extract the frozen target token I/O:
@@ -247,13 +253,12 @@ TARGET_IO_DIR=/shared/out/glm52-target-io \
 OUTPUT_DIR=/shared/out/glm52-dflash2 \
 MASK_TOKEN_ID=<verified-mask-id> PAD_TOKEN_ID=<verified-pad-id> \
 NUM_NPUS=8 \
-bash scripts/train_glm52_drafter_910b.sh
+bash scripts/train_drafter.sh
 ```
 
 Set `METHOD=dflash`, `dflash2`, or `dspark`. DFlash/DFlash2 accept
 `BLOCK_SIZE=8` or `16`; DSpark requires `BLOCK_SIZE=8`. Multi-node training also accepts
-`NNODES`, `NODE_RANK`, `MASTER_ADDR`, and `MASTER_PORT`. The deprecated
-`train_glm52_dflash2_910b.sh` is only a compatibility wrapper.
+`NNODES`, `NODE_RANK`, `MASTER_ADDR`, and `MASTER_PORT`.
 
 Every successful training run writes a resumable `step-N/` training checkpoint
 and one deployment artifact under `export/`:
@@ -267,11 +272,30 @@ export/
 ```
 
 The exported proposal count is `block_size - 1`: the physical block's first
-position is the known anchor and is never sampled. The export uses public
-Speculators-style keys where possible, but **all three GLM-5.2 methods** are
-marked `custom-glm52-vllm-ascend-adapter-required` until the exact deployment
-fork passes an offline-vs-runtime logits/acceptance parity gate. Public key
-names alone are not evidence of GLM-5.2 Ascend serving compatibility.
+position is the known anchor and is never sampled. DFlash, DFlash2 and DSpark
+have separate exporters and tensor contracts. Every new artifact is immutable
+and starts with status `candidate-not-deployable`; checksums bind its config,
+weights, target I/O, target/tokenizer identity, hidden taps and method settings.
+Legacy schema-v1 exports remain readable only for diagnosis and are permanently
+untrusted.
+
+On the actual Ascend host, first pin and record the exact vLLM,
+vLLM-Ascend and Speculators versions/commits plus CANN, torch-npu, driver,
+firmware and topology. Run method-specific load/logit/proposal parity and write
+machine-readable `glm-vllm-ascend-parity-results-v1` results. Only then attest:
+
+```bash
+PYTHONPATH=src python tools/attest_vllm_ascend_export.py attest \
+  --export /shared/out/glm52-dspark/export \
+  --runtime-identity /shared/identity/vllm-ascend-runtime.json \
+  --parity-results /shared/gate/dspark-parity-results.json
+```
+
+The command creates `deploy_attestation.json` and changes the manifest status
+to `runtime-attested`. Both files bind the exact candidate bytes and exact
+runtime identity; changing either invalidates deployment. DFlash2 uses the
+isolated adapter under `integrations/vllm_ascend/` and must never be presented
+as ordinary DFlash.
 
 Run a target-only versus speculative benchmark sequentially on the same 910B
 devices:
@@ -279,7 +303,7 @@ devices:
 ```bash
 TARGET_MODEL=/shared/models/GLM-5.2-bf16 \
 DRAFTER_EXPORT=/shared/out/glm52-dspark/export \
-PROMPTS_JSONL=/shared/eval/fixed-prompts.jsonl \
+PROMPTS=/shared/eval/fixed-prompts.jsonl \
 OUT_DIR=/shared/eval/glm52-dspark-b8 \
 TP_SIZE=16 MAX_SAMPLES=100 MAX_TOKENS=2048 \
 bash scripts/eval_vllm_ascend.sh
@@ -336,11 +360,13 @@ there is no command-line bypass.
 - The real 910B hidden parity, two-rank FSDP2 resume, export load, and serving
   ABI gates must still be run on the actual CANN/torch-npu/SGLang/vLLM-Ascend
   deployment stack.
-- The benchmark launcher intentionally blocks every current GLM-5.2 export.
-  DFlash, DFlash2 and DSpark each need a validated proposer path in the exact
-  target vLLM-Ascend/vendor fork; DFlash2 additionally needs its selector
-  adapter. After integration, change the manifest only as part of a tested
-  runtime-adapter patch, not by hand.
+- The benchmark launcher blocks an unattested candidate, a changed artifact,
+  or a runtime identity different from its attestation. The server-side parity
+  work must still be completed on the actual target fork; never edit manifest
+  status or attestation files by hand.
+- Formal evaluation requires the pinned vLLM response extension that returns
+  raw completion token IDs. Text re-tokenization is not an acceptable greedy
+  parity check.
 - `MASK_TOKEN_ID` is mandatory and must come from the actual tokenizer/runtime;
   EOS or PAD must not be substituted.
 - Quantized target token-I/O artifacts, mismatched model revisions, ambiguous

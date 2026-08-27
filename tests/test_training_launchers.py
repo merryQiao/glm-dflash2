@@ -36,12 +36,6 @@ class TrainingLaunchersTest(unittest.TestCase):
             self.assertIn(value, text)
         self.assertNotIn("TARGET_MODEL", text)
 
-    def test_old_dflash2_launcher_is_only_a_unified_compatibility_wrapper(self):
-        text = (ROOT / "scripts/train_glm52_dflash2_910b.sh").read_text()
-        self.assertIn("METHOD=dflash2", text)
-        self.assertIn("train_glm52_drafter_910b.sh", text)
-        self.assertNotIn("train_dflash2_offline.py", text)
-
     def test_extract_and_hardware_gate_are_explicit(self):
         extract = (ROOT / "scripts/extract_glm52_io.sh").read_text()
         self.assertIn("MODEL_PATH", extract)
@@ -56,7 +50,6 @@ class TrainingLaunchersTest(unittest.TestCase):
         self.assertIn("BLOCK_SIZE", gate)
         self.assertIn('--block-size "$BLOCK_SIZE"', gate)
         self.assertIn("train_drafter_offline.py", gate)
-        self.assertNotIn("train_dflash2_offline.py", gate)
 
     def test_training_launcher_supports_multinode_torchrun(self):
         text = (ROOT / "scripts/train_glm52_drafter_910b.sh").read_text()
@@ -93,7 +86,9 @@ class TrainingLaunchersTest(unittest.TestCase):
             self.assertIn(value, readme)
         runbook = (ROOT / "docs/ASCEND_910B_RUNBOOK.md").read_text()
         self.assertIn("real 910B", runbook)
-        self.assertIn("train_glm52_drafter_910b.sh", runbook)
+        self.assertIn("scripts/train_drafter.sh", runbook)
+        self.assertIn("candidate-not-deployable", runbook)
+        self.assertIn("deploy_attestation.json", runbook)
         self.assertIn("Legacy v1", runbook)
 
 

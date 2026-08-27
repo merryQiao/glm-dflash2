@@ -1,0 +1,20 @@
+{
+  "fixture_schema": "vllm-speculators-dspark-abi-v1",
+  "vllm_commit": "PIN_ON_ASCEND_HOST",
+  "vllm_ascend_commit": "PIN_ON_ASCEND_HOST",
+  "speculators_commit": "PIN_ON_ASCEND_HOST",
+  "config_class": "DSparkSpeculatorConfig",
+  "architecture": "DSparkDraftModel",
+  "markov_rank": 256,
+  "markov_head_type": "vanilla",
+  "confidence_head": true,
+  "sample_from_anchor": false,
+  "block_size": 8,
+  "num_speculative_tokens": 7,
+  "required_state_keys": [
+    "markov_head.markov_w1.weight",
+    "markov_head.markov_w2.weight",
+    "confidence_head.proj.weight",
+    "confidence_head.proj.bias"
+  ]
+}

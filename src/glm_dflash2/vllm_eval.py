@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import time
@@ -100,6 +101,28 @@ def load_prompts(path: str | Path, *, max_samples: int = 0) -> list[dict[str, An
     return prompts
 
 
+def prompt_fixture_sha256(prompts: Sequence[Mapping[str, Any]]) -> str:
+    raw = json.dumps(
+        list(prompts), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _output_token_ids(response: Mapping[str, Any], choice: Mapping[str, Any]) -> list[int]:
+    candidates = (
+        choice.get("token_ids"),
+        choice.get("output_token_ids"),
+        response.get("output_token_ids"),
+        (response.get("usage") or {}).get("output_token_ids"),
+    )
+    for value in candidates:
+        if isinstance(value, list) and all(isinstance(token, int) for token in value):
+            return [int(token) for token in value]
+    raise ValueError(
+        "vLLM response is missing raw output token IDs; enable the pinned return_token_ids extension"
+    )
+
+
 def benchmark_openai_server(
     *,
     base_url: str,
@@ -111,6 +134,7 @@ def benchmark_openai_server(
     seed: int,
     warmup_requests: int = 2,
     timeout: float = 1800.0,
+    rejection_mode: str = "none",
 ) -> dict[str, Any]:
     if max_tokens < 1 or warmup_requests < 0:
         raise ValueError("max_tokens must be positive and warmup_requests non-negative")
@@ -126,6 +150,9 @@ def benchmark_openai_server(
             "top_p": top_p,
             "seed": request_seed,
             "stream": False,
+            # Required by the pinned vLLM-Ascend response extension. Text is
+            # insufficient for lossless parity because decoding is not injective.
+            "return_token_ids": True,
         }
         payload["messages" if is_chat else "prompt"] = row["messages" if is_chat else "prompt"]
         started = time.perf_counter()
@@ -157,15 +184,18 @@ def benchmark_openai_server(
                 "completion_tokens": int(completion_tokens),
                 "latency_seconds": latency,
                 "output_text": str(output or ""),
+                "output_token_ids": _output_token_ids(response, choice),
             }
         )
     wall = time.perf_counter() - started
     after = parse_spec_decode_metrics(_read_text(base_url + "/metrics", timeout))
     completion_tokens = sum(item["completion_tokens"] for item in samples)
     result: dict[str, Any] = {
-        "schema": "glm-vllm-ascend-benchmark-v1",
+        "schema": "glm-vllm-ascend-benchmark-v2",
         "server": base_url,
         "model": model,
+        "fixture_sha256": prompt_fixture_sha256(prompts),
+        "rejection_mode": str(rejection_mode),
         "sampling": {
             "temperature": temperature,
             "top_p": top_p,
@@ -196,14 +226,27 @@ def compare_benchmark_results(
     speculative_samples = {str(row["sample_id"]): row for row in speculative["samples"]}
     if baseline_samples.keys() != speculative_samples.keys():
         raise ValueError("baseline and speculative sample sets differ")
+    if baseline.get("fixture_sha256") != speculative.get("fixture_sha256"):
+        raise ValueError("baseline and speculative prompt fixtures differ")
+    if baseline.get("sampling") != speculative.get("sampling"):
+        raise ValueError("baseline and speculative sampling settings differ")
+    missing_ids = [
+        key
+        for key in baseline_samples
+        if not isinstance(baseline_samples[key].get("output_token_ids"), list)
+        or not isinstance(speculative_samples[key].get("output_token_ids"), list)
+    ]
+    if missing_ids:
+        raise ValueError(f"raw output token IDs are missing for {len(missing_ids)} samples")
     matches = [
-        baseline_samples[key]["output_text"] == speculative_samples[key]["output_text"]
+        baseline_samples[key].get("output_token_ids")
+        == speculative_samples[key].get("output_token_ids")
         for key in baseline_samples
     ]
     exact = all(matches)
     if require_exact_outputs and not exact:
         mismatched = sum(not value for value in matches)
-        raise ValueError(f"lossless greedy parity failed for {mismatched} samples")
+        raise ValueError(f"lossless greedy token-ID parity failed for {mismatched} samples")
     baseline_tps = float(baseline["summary"]["tps"])
     speculative_tps = float(speculative["summary"]["tps"])
     if baseline_tps <= 0:
@@ -224,11 +267,17 @@ def compare_benchmark_results(
         )
     if float(spec_decode["drafts"]) <= 0 or float(spec_decode["draft_tokens"]) <= 0:
         raise ValueError("speculative run reported no active draft steps")
+    temperature = float((speculative.get("sampling") or {}).get("temperature", 0.0))
+    if temperature > 0 and speculative.get("rejection_mode") != "standard":
+        raise ValueError("sampling evaluation requires standard rejection sampling")
     return {
-        "schema": "glm-vllm-ascend-comparison-v1",
+        "schema": "glm-vllm-ascend-comparison-v2",
         "baseline_tps": baseline_tps,
         "speculative_tps": speculative_tps,
         "speedup": speculative_tps / baseline_tps,
+        "exact_token_id_match": exact,
+        "exact_token_id_match_rate": sum(matches) / len(matches),
+        # Compatibility aliases for existing table scripts.
         "exact_output_match": exact,
         "exact_output_match_rate": sum(matches) / len(matches),
         "mean_acceptance_length": spec_decode["mean_acceptance_length"],

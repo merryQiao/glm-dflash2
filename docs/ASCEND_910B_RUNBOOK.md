@@ -27,7 +27,7 @@ WORKSPACE_MAP=/shared/data/workspace_map.jsonl \
 WORKSPACE_CACHE=/shared/cache/vibe-workspaces \
 OPEN_SWE_STORE=/shared/data/open_swe_original.sqlite \
 OUTPUT_JSONL=/shared/out/trajectories-shard-0.jsonl \
-bash scripts/run_stage_a_trajectories.sh
+bash scripts/generate_trajectories.sh
 ```
 
 For the pinned SGLang 0.5.16 image, first run
@@ -50,7 +50,7 @@ TRAJECTORY_JSONL=/shared/out/trajectories-shard-0.jsonl \
 OUTPUT_DIR=/shared/out/hidden-v2-shard-0 \
 TP_SIZE=32 EP_SIZE=32 NNODES=2 NODE_RANK=0 \
 DIST_INIT_ADDR=<rank-0-host> NCCL_PORT=29500 \
-bash scripts/run_stage_b_hidden.sh
+bash scripts/extract_hidden_sglang.sh
 ```
 
 Expected logical taps are `[1,20,38,56,75]`; the cache must contain both
@@ -121,7 +121,7 @@ TARGET_IO_DIR=/shared/out/glm52-target-io \
 OUTPUT_DIR=/shared/out/glm52-dspark \
 MASK_TOKEN_ID=<verified-id> PAD_TOKEN_ID=<verified-id> \
 NUM_NPUS=8 NNODES=1 NODE_RANK=0 \
-bash scripts/train_glm52_drafter_910b.sh
+bash scripts/train_drafter.sh
 ```
 
 Use `METHOD=dflash`, `dflash2`, or `dspark`. DFlash and DFlash2 support
@@ -135,13 +135,15 @@ For multiple nodes, use identical
 arguments and set `NODE_RANK` uniquely. Resume only from a `COMPLETE` step and
 do not change cache identity, method, architecture, optimizer or scheduler.
 
-## 7. Export and serving ABI gate
+## 7. Candidate export, serving ABI parity and attestation
 
 Training writes `OUTPUT_DIR/export`. Unlike the resumable training checkpoint,
-this deployment artifact contains the trained draft plus frozen target
+this candidate contains the trained draft plus frozen target
 `embed_tokens.weight` and `lm_head.weight`. Verify all hashes in
 `export_manifest.json` before loading it. Its config fixes
-`sample_from_anchor=false`, so B8/B16 request 7/15 speculative tokens.
+`sample_from_anchor=false`, so B8/B16 request 7/15 speculative tokens. A new
+schema-v2 export has status `candidate-not-deployable`; legacy v1 is permanently
+untrusted.
 
 Load the exported draft in the exact Ascend serving fork and compare a fixed
 batch against offline training with the same token IDs, anchors, positions and
@@ -151,11 +153,35 @@ cache fingerprint:
 - DFlash2: top-16 candidate IDs/scores and selector scores;
 - DSpark: Markov chunk scores and confidence logits.
 
-Public Speculators config/key conventions are used where possible, but all
-three exports are marked `custom-glm52-vllm-ascend-adapter-required`. Do not
-bypass this preflight. First implement or select the method-specific GLM-5.2
-proposer in the exact serving fork and pass offline/runtime parity; DFlash2 also
-requires its selector adapter.
+The three method-specific exporters are under `src/glm_dflash2/vllm_ascend/`.
+DFlash2 additionally uses only the isolated adapter in
+`integrations/vllm_ascend/`; it is not a DFlash alias.
+The checked-in `integrations/vllm_ascend/VERSION` and DSpark ABI fixture use
+`PIN_ON_ASCEND_HOST` for runtime commits. `apply_patch.sh` deliberately refuses
+installation until those values are replaced with the commits actually tested
+on the deployment host.
+
+Before parity, record an exact runtime identity. Unknown versions/commits fail
+closed in production. At minimum pin vLLM, vLLM-Ascend and Speculators
+version+commit, adapter revision, CANN, torch-npu, driver, firmware, NPU model,
+runner/backend, TP/EP/PP/DP/nodes and scheduler feature state. Keep graph,
+chunked prefill and prefix cache disabled for the initial gate.
+
+Parity results must use schema `glm-vllm-ascend-parity-results-v1`, bind the
+exact candidate hash/runtime identity, and pass candidate load, method logits,
+proposal token IDs, standard rejection sampling and positive speculative
+counters. Then create the deploy attestation:
+
+```bash
+PYTHONPATH=src python tools/attest_vllm_ascend_export.py attest \
+  --export /shared/out/glm52-dspark/export \
+  --runtime-identity /shared/identity/vllm-ascend-runtime.json \
+  --parity-results /shared/gate/dspark-parity-results.json
+```
+
+This writes `deploy_attestation.json` and changes the status to
+`runtime-attested`. Never edit either file by hand. Any candidate byte or
+runtime drift invalidates it.
 
 ## 8. Acceptance and TPS benchmark
 
@@ -164,17 +190,21 @@ Use the same NPU set sequentially, never two co-resident target replicas:
 ```bash
 TARGET_MODEL=/shared/models/GLM-5.2-bf16 \
 DRAFTER_EXPORT=/shared/out/glm52-dspark/export \
-PROMPTS_JSONL=/shared/eval/fixed-prompts.jsonl \
+PROMPTS=/shared/eval/fixed-prompts.jsonl \
 OUT_DIR=/shared/eval/glm52-dspark-b8 \
 TP_SIZE=16 MAX_SAMPLES=100 MAX_TOKENS=2048 \
 bash scripts/eval_vllm_ascend.sh
 ```
 
 The output contains `baseline.json`, `speculative.json`, server logs, and
-`comparison.json`. Acceptance is derived from vLLM Prometheus counters using
+`comparison.json`. Before target allocation, the launcher collects the active
+runtime identity and validates the deploy attestation. Acceptance is derived
+from warmup-excluded vLLM Prometheus counter deltas using
 the official bonus-inclusive definition. TPS is measured from returned
 completion-token counts and wall time. For temperature zero, exact output
-parity is a hard gate. The launcher intentionally does not enable approximate
+parity is a hard gate and compares raw completion token IDs, not re-tokenized
+text; the pinned vLLM response extension must expose them. Sampling requires
+standard rejection sampling. The launcher intentionally does not enable approximate
 Block Verify or Entropy Verify.
 
 The current launcher supports only a local single-node `vllm serve` process and
