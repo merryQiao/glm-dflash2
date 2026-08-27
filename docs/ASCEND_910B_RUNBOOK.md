@@ -2,6 +2,8 @@
 
 This runbook is the operational checklist for the unified GLM-5.2 DFlash,
 DFlash2 and DSpark pipeline. Local tests do not replace the **real 910B** gates.
+Read `AI_HANDOFF.md` first; it is the authoritative current status and blocker
+ledger.
 
 ## 1. Pin the runtime identity
 
@@ -149,9 +151,11 @@ cache fingerprint:
 - DFlash2: top-16 candidate IDs/scores and selector scores;
 - DSpark: Markov chunk scores and confidence logits.
 
-DFlash and DSpark use the public Speculators config/key contract. DFlash2 is
-marked `custom-vllm-ascend-adapter-required`; do not bypass that preflight or
-mislabel it as stock DFlash.
+Public Speculators config/key conventions are used where possible, but all
+three exports are marked `custom-glm52-vllm-ascend-adapter-required`. Do not
+bypass this preflight. First implement or select the method-specific GLM-5.2
+proposer in the exact serving fork and pass offline/runtime parity; DFlash2 also
+requires its selector adapter.
 
 ## 8. Acceptance and TPS benchmark
 
@@ -173,10 +177,13 @@ completion-token counts and wall time. For temperature zero, exact output
 parity is a hard gate. The launcher intentionally does not enable approximate
 Block Verify or Entropy Verify.
 
-The local test suite checks config/state round-trip and benchmark arithmetic;
-it cannot prove that a particular CANN/vLLM-Ascend image contains the required
-GLM DSpark support. Record the image digest and package versions with every
-hardware result.
+The current launcher supports only a local single-node `vllm serve` process and
+will reject unvalidated GLM-5.2 exports. A BF16 GLM-5.2 deployment generally
+requires the existing multi-node launch topology; adapt only the server-launch
+portion after the runtime proposer passes parity, then reuse the benchmark and
+comparison logic. The local suite cannot prove that a CANN/vLLM-Ascend image
+contains the required GLM proposer. Record image digest and package commits
+with every hardware result.
 
 ## Legacy v1 policy
 

@@ -74,12 +74,13 @@ vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",position="0"} 9
                 baseline, speculative, require_exact_outputs=True
             )
 
-    def test_launcher_uses_sequential_baseline_and_spec_runs_and_rejects_dflash2(self):
+    def test_launcher_uses_sequential_runs_and_blocks_unvalidated_glm_adapter(self):
         root = Path(__file__).resolve().parents[1]
         script = (root / "scripts/eval_vllm_ascend.sh").read_text()
         self.assertIn('run_server "baseline"', script)
         self.assertIn('run_server "speculative"', script)
-        self.assertIn('custom-vllm-ascend-adapter-required', script)
+        self.assertIn('custom-glm52-vllm-ascend-adapter-required', script)
+        self.assertIn('GLM-5.2 runtime adapter has not passed', script)
         self.assertIn('--speculative-config', script)
         self.assertIn('ASCEND_RT_VISIBLE_DEVICES', script)
 

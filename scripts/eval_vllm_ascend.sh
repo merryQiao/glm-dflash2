@@ -41,8 +41,8 @@ RUNTIME_COMPATIBILITY=${export_fields[0]}
 METHOD=${export_fields[1]}
 NUM_SPECULATIVE_TOKENS=${export_fields[2]}
 ALGORITHM=${export_fields[3]}
-if [[ "${RUNTIME_COMPATIBILITY}" == "custom-vllm-ascend-adapter-required" ]]; then
-  echo "DFlash2 export requires its custom vLLM-Ascend adapter; stock serving is intentionally blocked." >&2
+if [[ "${RUNTIME_COMPATIBILITY}" == "custom-glm52-vllm-ascend-adapter-required" ]]; then
+  echo "GLM-5.2 runtime adapter has not passed its offline/runtime parity gate; serving is intentionally blocked." >&2
   exit 2
 fi
 if [[ "${METHOD}" != "${ALGORITHM}" ]]; then

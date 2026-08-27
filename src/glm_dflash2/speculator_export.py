@@ -221,11 +221,11 @@ def export_speculator(
         target_io=target_io,
     )
     save_file(weights, weights_path)
-    runtime = (
-        "custom-vllm-ascend-adapter-required"
-        if method == "dflash2"
-        else "vllm-ascend-stock"
-    )
+    # The public speculators key layout is useful for export/round-trip, but it
+    # does not prove that the selected Ascend runtime implements this GLM-5.2
+    # draft architecture.  Fail closed until the deployment fork has passed
+    # an offline-vs-runtime logits/acceptance parity gate for the method.
+    runtime = "custom-glm52-vllm-ascend-adapter-required"
     manifest = {
         "schema": _EXPORT_SCHEMA,
         "method": method,

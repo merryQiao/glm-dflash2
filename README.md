@@ -17,7 +17,9 @@ The production contract is fixed:
   physical block size 8. A physical block contains one clean anchor, so B8/B16
   predict 7/15 speculative tokens respectively.
 
-See [AI_HANDOFF.md](AI_HANDOFF.md) for project context and
+**Server takeover must start with [AI_HANDOFF.md](AI_HANDOFF.md).** It is the
+authoritative status ledger and records the real-hardware/runtime blockers that
+cannot be closed locally. See
 [docs/ASCEND_910B_RUNBOOK.md](docs/ASCEND_910B_RUNBOOK.md) for executable
 commands and hardware gates.
 
@@ -265,11 +267,11 @@ export/
 ```
 
 The exported proposal count is `block_size - 1`: the physical block's first
-position is the known anchor and is never sampled. DFlash and DSpark exports
-use the public Speculators key/config contract. DFlash2 is exported exactly for
-round-trip and provenance, but is explicitly marked
-`custom-vllm-ascend-adapter-required`; stock vLLM-Ascend must not load it as
-ordinary DFlash.
+position is the known anchor and is never sampled. The export uses public
+Speculators-style keys where possible, but **all three GLM-5.2 methods** are
+marked `custom-glm52-vllm-ascend-adapter-required` until the exact deployment
+fork passes an offline-vs-runtime logits/acceptance parity gate. Public key
+names alone are not evidence of GLM-5.2 Ascend serving compatibility.
 
 Run a target-only versus speculative benchmark sequentially on the same 910B
 devices:
@@ -334,9 +336,11 @@ there is no command-line bypass.
 - The real 910B hidden parity, two-rank FSDP2 resume, export load, and serving
   ABI gates must still be run on the actual CANN/torch-npu/SGLang/vLLM-Ascend
   deployment stack.
-- Stock vLLM-Ascend serving is wired only for DFlash and DSpark. DFlash2 still
-  needs a method-specific proposer adapter and is blocked by the benchmark
-  launcher until that adapter exists.
+- The benchmark launcher intentionally blocks every current GLM-5.2 export.
+  DFlash, DFlash2 and DSpark each need a validated proposer path in the exact
+  target vLLM-Ascend/vendor fork; DFlash2 additionally needs its selector
+  adapter. After integration, change the manifest only as part of a tested
+  runtime-adapter patch, not by hand.
 - `MASK_TOKEN_ID` is mandatory and must come from the actual tokenizer/runtime;
   EOS or PAD must not be substituted.
 - Quantized target token-I/O artifacts, mismatched model revisions, ambiguous

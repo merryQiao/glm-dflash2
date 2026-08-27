@@ -56,7 +56,7 @@ class SpeculatorExportTest(unittest.TestCase):
         }
         return FrozenTargetIO(embed, head, manifest)
 
-    def test_standard_dflash_and_dspark_export_contains_complete_runtime_weights(self):
+    def test_dflash_and_dspark_export_contains_complete_runtime_weights(self):
         for method in ("dflash", "dspark"):
             with self.subTest(method=method), tempfile.TemporaryDirectory() as tmp:
                 config = self._config()
@@ -86,7 +86,10 @@ class SpeculatorExportTest(unittest.TestCase):
                     self.assertNotIn("confidence_head.weight", weights)
 
                 manifest = json.loads((Path(tmp) / "export_manifest.json").read_text())
-                self.assertEqual(manifest["runtime_compatibility"], "vllm-ascend-stock")
+                self.assertEqual(
+                    manifest["runtime_compatibility"],
+                    "custom-glm52-vllm-ascend-adapter-required",
+                )
                 self.assertEqual(manifest["target_model_fingerprint"], "model-sha")
                 self.assertTrue((Path(tmp) / "config.py").is_file())
 
@@ -109,11 +112,10 @@ class SpeculatorExportTest(unittest.TestCase):
                     self.assertTrue(torch.equal(actual[key].cpu(), expected[key]), key)
                 self.assertTrue(torch.equal(loaded.embed_tokens_weight, target_io.embed_tokens.weight))
                 self.assertTrue(torch.equal(loaded.lm_head_weight, target_io.lm_head.weight))
-                if method == "dflash2":
-                    self.assertEqual(
-                        loaded.manifest["runtime_compatibility"],
-                        "custom-vllm-ascend-adapter-required",
-                    )
+                self.assertEqual(
+                    loaded.manifest["runtime_compatibility"],
+                    "custom-glm52-vllm-ascend-adapter-required",
+                )
 
 
 if __name__ == "__main__":
