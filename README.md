@@ -258,8 +258,7 @@ bash scripts/train_drafter.sh
 
 Set `METHOD=dflash`, `dflash2`, or `dspark`. DFlash/DFlash2 accept
 `BLOCK_SIZE=8` or `16`; DSpark requires `BLOCK_SIZE=8`. Multi-node training also accepts
-`NNODES`, `NODE_RANK`, `MASTER_ADDR`, and `MASTER_PORT`. The deprecated
-`train_glm52_dflash2_910b.sh` is only a compatibility wrapper.
+`NNODES`, `NODE_RANK`, `MASTER_ADDR`, and `MASTER_PORT`.
 
 Every successful training run writes a resumable `step-N/` training checkpoint
 and one deployment artifact under `export/`:

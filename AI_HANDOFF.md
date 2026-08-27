@@ -395,7 +395,6 @@ bash scripts/train_drafter.sh
 
 - `scripts/train_drafter.sh`：唯一推荐 launcher；
 - `tools/train_drafter_offline.py`：统一 CLI；
-- `scripts/train_glm52_dflash2_910b.sh`：仅为旧命令兼容 wrapper，不是另一套实现。
 
 不要用 EOS/PAD 猜测 MASK ID。必须从实际 tokenizer/runtime 验证。
 

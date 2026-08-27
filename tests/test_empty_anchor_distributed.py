@@ -16,7 +16,7 @@ from glm_dflash2.dflash2_model import Qwen3DFlash2DraftModel, build_dflash2_conf
 from glm_dflash2.distributed import configure_accumulation, distributed_any
 from glm_dflash2.offline_trainer import OfflineDFlash2Trainer
 from glm_dflash2.target_io import FrozenTargetIO
-from tools.train_dflash2_offline import _sample_or_dummy_anchors
+from tools.train_drafter_offline import _sample_or_dummy_anchors
 
 
 def _worker(rank: int, rendezvous: str, reports: str) -> None:
@@ -60,13 +60,14 @@ def _worker(rank: int, rendezvous: str, reports: str) -> None:
             num_anchors=1, token_chunk_size=2, vocab_chunk_size=5,
         )
         batch = {
+            "sample_ids": [f"rank-{rank}"],
             "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6]]),
             "attention_mask": torch.ones(1, 6, dtype=torch.bool),
             "loss_mask": torch.ones(1, 6, dtype=torch.bool) if rank == 0
                          else torch.zeros(1, 6, dtype=torch.bool),
             "hidden_states": torch.randn(1, 6, 16),
         }
-        anchors, keep, local_has = _sample_or_dummy_anchors(batch, trainer)
+        anchors, keep, local_has = _sample_or_dummy_anchors(batch, trainer, epoch=0)
         global_has = distributed_any(local_has, torch.device("cpu"))
         configure_accumulation(draft, synchronize=True)
         output = trainer(batch, anchor_positions=anchors, block_keep_mask=keep)

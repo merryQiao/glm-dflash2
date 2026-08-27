@@ -27,10 +27,6 @@ class AscendLauncherTest(unittest.TestCase):
         self.assertNotIn("generate_trajectories.py", train)
         self.assertNotIn("extract_hidden_sglang.py", train)
 
-    def test_legacy_two_pass_launcher_is_explicitly_deprecated(self):
-        script = (ROOT / "scripts/build_two_pass_cache.sh").read_text()
-        self.assertIn("DEPRECATED", script)
-
     def test_stage_a_launcher_passes_explicit_ascend_backend(self):
         script = (ROOT / "scripts/run_stage_a_trajectories.sh").read_text()
         self.assertIn('--device "${DEVICE:-npu}"', script)
