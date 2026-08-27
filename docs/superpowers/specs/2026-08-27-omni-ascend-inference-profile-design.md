@@ -163,7 +163,7 @@ Every per-request JSONL record includes modality, exact token IDs, its own
 preprocessing latency, optional vLLM engine request latency, enclosing batch
 engine/end-to-end latency, and evaluation metadata/result when requested.
 
-## Paired baseline/speculative comparison
+## Comparison identity
 
 Each profile separates two identities:
 
@@ -182,23 +182,14 @@ Each profile separates two identities:
 - `variant_identity`: `target_only` or the exact speculative method, drafter
   export digest, adapter version, and speculative configuration.
 
-A baseline and speculative profile are pairable only when their comparison
-invariant fingerprints match and their variant identities differ only in the
-intended speculative system.
-
-A strict paired latency/speedup comparison additionally requires exact prompt
-and response token IDs for every request in every decoding mode. Different
-sampled token content can change context and MoE routing even at equal length.
-If identical sampled paths cannot be reproduced, each variant may report its
-independent throughput distribution, but paired speedup is ineligible.
-
-Paired measurements run on exclusive identical devices for an even number of
-rounds, at least four. A balanced ABBA order gives each variant the same number
-of first and second executions, with the same warmup policy before each
-variant. For both engine and end-to-end clocks, per-round speedup is frozen as
-`baseline_elapsed / speculative_elapsed` (larger is faster). The report stores
-every round and summarizes them with median, median absolute deviation,
-minimum, and maximum; it never reports only one ratio of grand totals.
+This profiler produces one self-contained variant profile and does not compute
+a paired speedup. A downstream baseline/speculative comparator may pair two
+profiles only when their comparison-invariant fingerprints match. Strict
+paired latency additionally requires exact prompt and response token IDs for
+every request in every decoding mode; otherwise only independent throughput
+distributions may be reported. Multi-round ABBA orchestration and speedup
+statistics belong to that downstream comparison tool and are outside this
+metric-completion change.
 
 ## Failure policy
 
