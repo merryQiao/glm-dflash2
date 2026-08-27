@@ -165,11 +165,10 @@ engine/end-to-end latency, and evaluation metadata/result when requested.
 
 ## Comparison identity
 
-Each profile separates two identities:
+Each profile records:
 
-- `comparison_invariant_fingerprint`: target and processor revisions,
-  an actual artifact-manifest digest over all model/processor files,
-  vLLM/vLLM-Ascend/CANN/torch/torch-npu build identities, dtype and
+- `comparison_identity.fingerprint`: declared target and processor revisions,
+  vLLM/vLLM-Ascend/torch/torch-npu package identities, dtype and
   quantization, hardware and TP/EP topology, every non-speculative engine
   option (including model length, sequence and batched-token limits,
   scheduler, prefix cache, chunked prefill, and graph/eager mode), normalized
@@ -179,15 +178,20 @@ Each profile separates two identities:
   unless it is first materialized and the actual fetched bytes are frozen and
   hashed. When evaluation is enabled, the invariant also binds scorer version,
   metric, and reference digest.
-- `variant_identity`: `target_only` or the exact speculative method, drafter
-  export digest, adapter version, and speculative configuration.
+- `comparison_identity.strict_artifact_manifest_available=false`: this version
+  does not hash the full local model/processor tree and therefore does not
+  overclaim immutable artifact-level pairing.
+- `variant_identity={"kind":"target_only"}`: this entry point does not load a
+  drafter. A future speculative runtime must populate its own identity from the
+  adapter and actual drafter artifact; a CLI label alone is forbidden.
 
 This profiler produces one self-contained variant profile and does not compute
 a paired speedup. A downstream baseline/speculative comparator may pair two
-profiles only when their comparison-invariant fingerprints match. Strict
+profiles only when their fingerprints match, and may claim strict artifact
+pairing only after a future file-level artifact manifest is added. Strict
 paired latency additionally requires exact prompt and response token IDs for
 every request in every decoding mode; otherwise only independent throughput
-distributions may be reported. Multi-round ABBA orchestration and speedup
+distributions may be reported. Multi-round orchestration and speedup
 statistics belong to that downstream comparison tool and are outside this
 metric-completion change.
 
@@ -198,9 +202,10 @@ during inference on missing outputs, empty completions, mismatched counts,
 mixed evaluation metrics, malformed references, or unavailable required HBM
 telemetry. JSONL and profile data are written to temporary files and atomically
 renamed only after every batch, worker RPC, and scorer succeeds; a success
-marker binds their checksums. Failed runs cannot leave outputs that look
-complete. There is no backend fallback, native-model path, retokenization, or
-silent metric omission.
+marker binds their checksums. All three final paths are locked from preflight
+through publication. Failed runs cannot leave outputs that look complete.
+There is no backend fallback, native-model path, retokenization, or silent
+metric omission.
 
 ## Verification
 

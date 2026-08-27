@@ -356,9 +356,12 @@ def profile_batch_kind(row: Mapping[str, Any]) -> str:
     types = [value for value in types if value in MEDIA_TYPES]
     if not types:
         return "text"
-    if len(types) > 1:
-        return "multi_image" if set(types) == {"image"} else "other"
-    return types[0]
+    unique_types = set(types)
+    if unique_types == {"image"} and len(types) > 1:
+        return "multi_image"
+    if len(unique_types) == 1:
+        return next(iter(unique_types))
+    return "other"
 
 
 def profile_batches(

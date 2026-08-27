@@ -146,10 +146,12 @@ python inference_qwen3-omni.py \
   --profile-json outputs/thinker_dry_run.json
 ```
 
-Run a real A2 profile. The warmup call is excluded from every throughput and
-latency aggregate. HBM telemetry is required by default and is collected from
-every vLLM TP worker through `LLM.collective_rpc` and the rank-local
-`torch_npu` allocator:
+Run a real A2 profile. Each warmup round uses the first real batch shape of
+every actual modality present, is excluded from every throughput/latency
+aggregate, and is followed by public `LLM.reset_mm_cache()` so measured media
+cannot hit vLLM's warmup MM cache. HBM telemetry is required by default and is
+collected from every vLLM TP worker through `LLM.collective_rpc` and the
+rank-local `torch_npu` allocator:
 
 ```bash
 ASCEND_HARDWARE=a2 \
@@ -179,7 +181,9 @@ measured request.
 
 Every successful real run publishes three files: the JSONL, the profile JSON,
 and `<profile>.SUCCESS.json`. The success marker is written last and binds the
-other two files by SHA-256. Treat files without this marker as incomplete.
+other two files by SHA-256. All three final paths are locked for the entire
+preflight/inference/publish window so overlapping invocations cannot mix
+artifacts. Treat files without this marker as incomplete.
 
 The `memory` section contains per-rank current and peak allocated/reserved HBM,
 plus precisely named TP reductions. These are `torch_npu_allocator` values,

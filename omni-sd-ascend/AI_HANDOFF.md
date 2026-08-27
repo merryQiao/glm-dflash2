@@ -126,9 +126,15 @@ latency/throughput，以及每个 TP worker 的 `torch_npu_allocator` HBM。默�
 `--allow-missing-hbm` 只允许用于诊断，不能用于正式表格。不要把 dry-run 的 plan JSON
 当成性能结果，也不要把 batch latency 复制成每个 request 的 latency。
 
+warmup 会为输入中每个实际 modality 运行第一个真实 batch shape，然后调用 pinned vLLM
+公开的 `LLM.reset_mm_cache()` 清空多模态 processor cache，再进入正式测量。该 reset 失败
+时必须终止，不能让第一批 measured media 因 warmup cache hit 获得虚假的低延迟。
+
 正式结果必须同时存在 JSONL、profile JSON 和 `<profile>.SUCCESS.json`，且 marker 中
 两个 SHA-256 与文件一致。Audio/Vision Encoder/Thinker 的内部 event timing 当前不可观测；
 Talker、MTP/code predictor、Code2Wav 没有加载。profile 会明确记录 unavailable，不得填 0。
+JSONL/profile/marker 三个 final path 会在整个 inference/publish 期间同时加锁，不能绕过锁
+并发写共享输出路径。
 
 若需要 benchmark accuracy，使用 JSONL 输入并为每条样本增加：
 

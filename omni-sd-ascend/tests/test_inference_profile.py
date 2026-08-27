@@ -323,7 +323,13 @@ def test_actual_payload_classifies_every_supported_batch_kind(tmp_path: Path):
     assert profile_batch_kind(row(image=paths["image"])) == "image"
     assert profile_batch_kind(row(image=[paths["image"], paths["image"]])) == "multi_image"
     assert profile_batch_kind(row(audio=paths["audio"])) == "audio"
+    double_audio = profile_batch_kind(
+        row(audio=[paths["audio"], paths["audio"]])
+    )
+    assert double_audio == "audio"
+    assert component_availability([double_audio])["vision_encoder"]["executed"] is False
     assert profile_batch_kind(row(video=paths["video"])) == "video"
+    assert profile_batch_kind(row(video=[paths["video"], paths["video"]])) == "video"
     assert profile_batch_kind(
         row(image=paths["image"], audio=paths["audio"])
     ) == "other"
@@ -556,6 +562,7 @@ def test_measured_profile_excludes_warmup_and_keeps_exact_ids(monkeypatch):
         def __init__(self):
             self.calls = []
             self.rpc_calls = []
+            self.mm_cache_resets = 0
 
         def generate(self, requests, sampling_params, use_tqdm):
             self.calls.append((requests, sampling_params, use_tqdm))
@@ -580,6 +587,9 @@ def test_measured_profile_excludes_warmup_and_keeps_exact_ids(monkeypatch):
                 }
                 for rank in range(4)
             ]
+
+        def reset_mm_cache(self):
+            self.mm_cache_resets += 1
 
     llm = LLM()
     monkeypatch.setattr(
@@ -641,6 +651,8 @@ def test_measured_profile_excludes_warmup_and_keeps_exact_ids(monkeypatch):
     assert records[0]["batch_engine_latency_ms"] == pytest.approx(100.0)
     assert records[0]["batch_end_to_end_latency_ms"] == pytest.approx(700.0)
     assert llm.rpc_calls == ["worker_reset_npu_peak", "worker_snapshot_npu_memory"]
+    assert llm.mm_cache_resets == 1
+    assert profile["warmup_policy"]["post_warmup_mm_cache_reset"] is True
     measured_params = llm.calls[1][1]
     assert measured_params[0].kwargs["seed"] != measured_params[1].kwargs["seed"]
 
@@ -657,6 +669,28 @@ def test_measured_profile_excludes_warmup_and_keeps_exact_ids(monkeypatch):
     )
     assert missing_hbm_profile["memory"]["available"] is False
     assert missing_hbm_profile["memory"]["source"] == "torch_npu_allocator"
+
+    def malformed_snapshot_rpc(function):
+        if function.__name__ == "worker_reset_npu_peak":
+            return [
+                {"rank": rank, "logical_device": rank, "physical_device": rank}
+                for rank in range(4)
+            ]
+        return [
+            {"rank": rank, "logical_device": rank, "physical_device": rank}
+            for rank in range(4)
+        ]
+
+    monkeypatch.setattr(llm, "collective_rpc", malformed_snapshot_rpc)
+    _, malformed_hbm_profile = cli.run_profile(
+        complete_config(),
+        rows,
+        complete_config()["vllm_batch_size"],
+        warmup=0,
+        allow_missing_hbm=True,
+    )
+    assert malformed_hbm_profile["memory"]["available"] is False
+    assert "missing fields" in malformed_hbm_profile["memory"]["reason"]
 
 
 def _load_inference_cli():
@@ -692,6 +726,32 @@ def test_comparison_identity_binds_local_media_bytes(tmp_path: Path):
     second = cli._comparison_identity(**arguments)
 
     assert first["fingerprint"] != second["fingerprint"]
+
+
+def test_warmup_uses_first_real_batch_shape_per_actual_modality(tmp_path: Path):
+    cli = _load_inference_cli()
+    image = tmp_path / "image.bin"
+    image.write_bytes(b"image")
+    rows = [
+        normalize_input_record(
+            {"id": "text", "text": "hello"}, index=0, base_dir=tmp_path
+        ),
+        normalize_input_record(
+            {"id": "image", "text": "describe", "image": str(image)},
+            index=1,
+            base_dir=tmp_path,
+        ),
+        normalize_input_record(
+            {"id": "text-2", "text": "again"}, index=2, base_dir=tmp_path
+        ),
+    ]
+
+    batches = cli._warmup_batches(rows, complete_config()["vllm_batch_size"])
+
+    assert [[row["condition_id"] for row in batch] for batch in batches] == [
+        ["text", "text-2"],
+        ["image"],
+    ]
 
 
 def test_profile_bundle_publishes_checksum_marker_last(tmp_path: Path):
@@ -744,3 +804,21 @@ def test_profile_bundle_failure_removes_all_final_artifacts(
     assert not output.exists()
     assert not profile.exists()
     assert not marker.exists()
+
+
+def test_profile_output_lock_rejects_concurrent_writer(tmp_path: Path):
+    cli = _load_inference_cli()
+    target = tmp_path / "profile.json"
+
+    with cli.ProfileOutputLock(target):
+        with pytest.raises(RuntimeError, match="already locked"):
+            with cli.ProfileOutputLock(target):
+                pass
+
+    shared_output = tmp_path / "shared.jsonl"
+    first_targets = [shared_output, tmp_path / "one.profile.json"]
+    second_targets = [shared_output, tmp_path / "two.profile.json"]
+    with cli.ProfileOutputLock(first_targets):
+        with pytest.raises(RuntimeError, match="already locked"):
+            with cli.ProfileOutputLock(second_targets):
+                pass

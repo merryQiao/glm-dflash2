@@ -98,6 +98,57 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ProfileContractError("--audio/--image/--video require --text")
 
 
+class ProfileOutputLock:
+    """Lock every final artifact for the entire inference-and-publish run."""
+
+    def __init__(self, targets: Path | Iterable[Path]):
+        values = [targets] if isinstance(targets, Path) else list(targets)
+        if not values:
+            raise ValueError("profile output lock needs at least one target")
+        lock_paths = {
+            target.resolve().with_suffix(target.suffix + ".lock")
+            for target in values
+        }
+        self.paths = sorted(lock_paths, key=str)
+        self._handles: list[Any] = []
+
+    def __enter__(self) -> "ProfileOutputLock":
+        import fcntl
+
+        try:
+            for path in self.paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                handle = path.open("a+", encoding="utf-8")
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    handle.close()
+                    raise
+                handle.seek(0)
+                handle.truncate()
+                handle.write(f"pid={os.getpid()}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+                self._handles.append(handle)
+        except BlockingIOError as error:
+            self._release()
+            raise RuntimeError(
+                "one or more profile outputs are already locked"
+            ) from error
+        return self
+
+    def _release(self) -> None:
+        import fcntl
+
+        for handle in reversed(self._handles):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+        self._handles.clear()
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self._release()
+
+
 def _jsonl_rows(path: Path, limit: int | None) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -388,6 +439,10 @@ def _comparison_identity(
             sampling_kwargs(config, str(row["condition_id"])) for row in rows
         ],
         "warmup": warmup,
+        "warmup_policy": {
+            "batch_shape": "first_measured_batch_per_actual_modality",
+            "post_warmup_mm_cache_reset": warmup > 0,
+        },
         "measurement_rounds": 1,
     }
     return {
@@ -417,6 +472,15 @@ def dry_run_profile(
         "model": config["model"],
         "generation": config["generation"],
     }
+
+
+def _warmup_batches(
+    rows: list[dict[str, Any]], sizes: dict[str, int]
+) -> list[list[dict[str, Any]]]:
+    representatives: dict[str, list[dict[str, Any]]] = {}
+    for batch in profile_batches(rows, sizes):
+        representatives.setdefault(profile_batch_kind(batch[0]), batch)
+    return list(representatives.values())
 
 
 def run_profile(
@@ -452,11 +516,23 @@ def run_profile(
         "end_to_end_seconds": 0.0,
     }
     for _ in range(warmup):
-        _, measurement = _generate(
-            [rows[0]], config, llm, processor, sampling_params_class
-        )
-        for key in warmup_measurements:
-            warmup_measurements[key] += float(measurement[key])
+        for warmup_batch in _warmup_batches(rows, sizes):
+            _, measurement = _generate(
+                warmup_batch,
+                config,
+                llm,
+                processor,
+                sampling_params_class,
+            )
+            for key in warmup_measurements:
+                warmup_measurements[key] += float(measurement[key])
+    if warmup > 0:
+        try:
+            llm.reset_mm_cache()
+        except Exception as error:
+            raise RuntimeError(
+                "vLLM multimodal cache reset failed after warmup"
+            ) from error
 
     records: list[dict[str, Any]] = []
     request_measurements: list[dict[str, Any]] = []
@@ -553,10 +629,19 @@ def run_profile(
         warmup=warmup_measurements,
     )
     if hbm_error is None:
-        memory = reduce_hbm_measurements(
-            hbm_snapshots,
-            tensor_parallel_size=expected_devices,
-        )
+        try:
+            memory = reduce_hbm_measurements(
+                hbm_snapshots,
+                tensor_parallel_size=expected_devices,
+            )
+        except Exception as error:
+            if not allow_missing_hbm:
+                raise
+            memory = {
+                "available": False,
+                "source": "torch_npu_allocator",
+                "reason": f"malformed worker HBM telemetry: {error}",
+            }
     else:
         memory = {
             "available": False,
@@ -573,6 +658,11 @@ def run_profile(
         "generation": config["generation"],
         "engine": engine_kwargs(config),
         "runtime": identity,
+        "warmup_policy": {
+            "rounds": warmup,
+            "batch_shape": "first_measured_batch_per_actual_modality",
+            "post_warmup_mm_cache_reset": warmup > 0,
+        },
         "comparison_identity": comparison_identity,
         "variant_identity": {"kind": "target_only"},
         "performance": performance,
@@ -628,30 +718,30 @@ def main() -> None:
         if args.dry_run
         else [args.output_jsonl, profile_path, success_marker]
     )
-    if not args.overwrite:
-        existing = [path for path in targets if path.exists()]
-        if existing:
-            raise FileExistsError(f"output already exists: {existing[0]}")
+    with ProfileOutputLock(targets):
+        if not args.overwrite:
+            existing = [path for path in targets if path.exists()]
+            if existing:
+                raise FileExistsError(f"output already exists: {existing[0]}")
 
-    if args.dry_run:
-        profile = dry_run_profile(config, rows, sizes)
-    else:
-        records, profile = run_profile(
-            config,
-            rows,
-            sizes,
-            args.warmup,
-            allow_missing_hbm=args.allow_missing_hbm,
-        )
-        write_profile_bundle(
-            output_jsonl=args.output_jsonl,
-            profile_json=profile_path,
-            success_marker=success_marker,
-            records=records,
-            profile=profile,
-        )
-    if args.dry_run:
-        atomic_write_json(profile_path, profile)
+        if args.dry_run:
+            profile = dry_run_profile(config, rows, sizes)
+            atomic_write_json(profile_path, profile)
+        else:
+            records, profile = run_profile(
+                config,
+                rows,
+                sizes,
+                args.warmup,
+                allow_missing_hbm=args.allow_missing_hbm,
+            )
+            write_profile_bundle(
+                output_jsonl=args.output_jsonl,
+                profile_json=profile_path,
+                success_marker=success_marker,
+                records=records,
+                profile=profile,
+            )
     print_summary(profile)
     print(f"Profile: {profile_path.resolve()}")
     if not args.dry_run:

@@ -149,19 +149,19 @@ Expected: failures from the old `_generate` tuple and old flat performance repor
 
 Time each `prepare_request`, the enclosing `LLM.generate`, and the outer batch
 independently. Reset/snapshot HBM around measured batches only. Add
-`--allow-missing-hbm` and `--variant-manifest`; the default structured variant
-is `target_only`, while a speculative manifest must contain method, drafter
-artifact digest, adapter version, and speculative config. Neither flag changes
-engine or sampling kwargs.
+`--allow-missing-hbm`; the only valid variant for this target-only runtime is
+`target_only`. A future speculative adapter must derive variant identity from
+the actually loaded drafter rather than a user-supplied label. Engine and
+sampling kwargs remain unchanged.
 
 - [ ] **Step 4: Add deterministic workload identity tests and implementation**
 
-Hash normalized rows/order/batches, per-request seeds, warmup, actual local
-media bytes and sizes, scorer/metric/reference data, full non-speculative
-engine/runtime/topology/software identity, and model/processor artifact
-manifests plus measurement rounds. Reject unfrozen remote media for strict
-identity. Tests change each bound field one at a time and require a different
-fingerprint.
+Hash normalized rows/order/batches, per-request seeds, warmup policy, actual
+local media bytes and sizes, scorer/metric/reference data, full
+non-speculative engine/runtime/topology/software identity, declared immutable
+model/processor revisions, and measurement rounds. Reject unfrozen remote
+media. Mark strict file-level artifact identity unavailable until an actual
+model/processor artifact manifest is supplied; do not overclaim pairing.
 
 - [ ] **Step 5: Add failure-order and production-route regression tests**
 
