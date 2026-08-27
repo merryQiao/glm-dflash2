@@ -24,10 +24,11 @@ This change adds:
 - opt-in benchmark evaluation from references carried in JSONL input;
 - an explicit component-availability section.
 
-The current vLLM-Ascend engine does not load Talker, MTP, or Code2Wav and does
-not expose stable request-scoped Audio Encoder, Vision Encoder, or internal
-Thinker NPU events. Those fields are emitted as `unavailable` with a reason.
-They are not omitted, approximated with wall time, or reported as zero.
+The current vLLM-Ascend engine does not load Talker, MTP, or Code2Wav. Audio
+Encoder, Vision Encoder, and Thinker may be loaded and executed but do not
+expose stable request-scoped internal NPU events. The component report records
+`loaded`, `executed`, `timing_available`, and `reason` separately. Unobservable
+timings are not omitted, approximated with wall time, or reported as zero.
 
 ## Measurement boundaries
 
@@ -49,11 +50,29 @@ The report keeps these clocks distinct:
 - `engine_seconds`: the enclosing vLLM generation calls;
 - `end_to_end_seconds`: preprocessing plus engine execution;
 - vLLM request latency: engine-provided arrival-to-finish time when available;
-- request end-to-end latency: the enclosing batch end-to-end time, because all
-  requests in an offline batch complete at the batch return boundary.
+- batch end-to-end latency: first preprocessing start to batch return.
+
+The profiler does **not** copy batch latency into every request. Each request
+has its own preprocessing latency. Request engine latency is included only when
+vLLM exposes valid arrival/finish timestamps; otherwise its availability is
+false. Offline generation provides only a common batch return boundary, so no
+request end-to-end latency distribution is invented.
 
 The existing completion TPS remains engine-only for backward compatibility.
-New names explicitly distinguish engine-only and end-to-end TPS.
+New names explicitly distinguish engine-only and end-to-end TPS. For either
+the full run or one modality, throughput is always computed from sums, never
+as the mean of batch TPS values:
+
+```text
+request_tps    = sum(request_count) / sum(relevant_batch_seconds)
+completion_tps = sum(response_token_count) / sum(relevant_batch_seconds)
+total_tps      = sum(prompt_token_count + response_token_count)
+                 / sum(relevant_batch_seconds)
+```
+
+`engine_*` uses engine batch seconds and `end_to_end_*` uses preprocessing plus
+engine batch seconds. Prompt and response counts come only from exact vLLM
+token IDs.
 
 ## Modality aggregation
 
@@ -68,16 +87,22 @@ wall time or sums concurrent request latency as elapsed time.
 The parent profiler process does not own vLLM model memory. HBM statistics are
 therefore queried on all vLLM workers via `LLM.collective_rpc`:
 
-- reset each worker's NPU allocator peak immediately after warmup;
-- read current and peak allocated/reserved bytes after each measured batch;
-- retain per-rank maxima;
-- report both the maximum rank and sum across ranks.
+- verify RPC returns exactly `tensor_parallel_size` ranks and that every rank
+  identifies one unique physical NPU;
+- synchronize every rank and reset allocator peaks immediately before each
+  measured batch;
+- synchronize and read current/peak allocated and reserved bytes immediately
+  after that batch;
+- retain each rank's largest batch peak, the largest rank peak, and
+  `max_batch_sum_of_rank_peaks`.
 
 The report labels these values `torch_npu_allocator`; they are not device-wide
-`npu-smi` usage and do not include unrelated processes. If the pinned vLLM
+`npu-smi` usage and do not include unrelated processes. A sum of independently
+observed run peaks is never called a simultaneous TP peak. If the pinned vLLM
 version lacks worker RPC or torch-npu memory APIs, profiling fails explicitly
-when HBM is required. `--allow-missing-hbm` is the only opt-out and records the
-reason in the report.
+when HBM is required. `--allow-missing-hbm` is the only opt-out: any missing or
+duplicate rank makes the entire memory section unavailable rather than
+aggregating partial ranks.
 
 ## Benchmark evaluation
 
@@ -93,12 +118,24 @@ carry:
 }
 ```
 
-Supported initial metrics are `exact_match`, `normalized_exact_match`, and
-`multiple_choice_accuracy`. Evaluation metadata survives normalization but is
-never passed into the model request. The report contains overall and
-per-modality accuracy plus evaluated/skipped counts. Mixing different metric
-names in one run is rejected. Inputs without evaluation metadata remain valid
-and produce an explicit unavailable evaluation section.
+The frozen scorer version is `omni_eval_v1`:
+
+- `exact_match`: Python Unicode strings must be byte-for-byte equal after JSON
+  decoding; no whitespace, case, or Unicode normalization is applied.
+- `normalized_exact_match`: apply Unicode NFKC, `casefold()`, replace every
+  Unicode punctuation category (`P*`) with one space, collapse all Unicode
+  whitespace runs to one ASCII space, and strip leading/trailing whitespace.
+- `multiple_choice_accuracy`: the reference is exactly one ASCII letter A-Z.
+  Apply NFKC and uppercase to the prediction, then select its first standalone
+  ASCII A-Z token using the regex `(?<![A-Z])[A-Z](?![A-Z])`; no match is
+  incorrect.
+
+Evaluation metadata survives normalization but is never passed into the model
+request. The report contains overall and per-modality accuracy plus evaluated
+and skipped counts. Mixing metric names in one run is rejected. A run with
+some references is available and reports skipped rows; a modality with zero
+evaluated rows is unavailable, not zero. Only a run with no references has an
+entirely unavailable evaluation section.
 
 This does not claim to recreate the deleted legacy `benchmark_helper`, which
 was absent from the supplied archive. Dataset-specific answer extraction must
@@ -116,16 +153,34 @@ The top-level profile contains:
 - `components` with availability and reasons for Audio Encoder, Vision
   Encoder, Thinker, Talker, MTP, and Code2Wav.
 
-Every per-request JSONL record includes modality, exact token IDs,
-preprocessing, engine, and end-to-end latency plus evaluation metadata/result
-when requested.
+Every per-request JSONL record includes modality, exact token IDs, its own
+preprocessing latency, optional vLLM engine request latency, enclosing batch
+engine/end-to-end latency, and evaluation metadata/result when requested.
+
+## Paired baseline/speculative comparison
+
+Each profile contains a versioned workload fingerprint over normalized request
+content, request order, computed batch boundaries, target model and revision,
+runtime/topology, sampling parameters, per-request seeds, warmup count, and
+measurement rounds. A baseline and speculative profile are pairable only when
+these fingerprints match.
+
+A strict latency/speedup comparison additionally requires identical request
+counts and per-request completion-token counts; greedy runs also require exact
+prompt and response token IDs. Any mismatch is recorded as ineligible rather
+than silently interpreted as speedup. Token-throughput reports may still show
+their independently normalized TPS, but the paired `speedup` field is withheld
+unless the strict eligibility checks pass.
 
 ## Failure policy
 
 The profiler fails before allocation on invalid input/configuration and fails
 during inference on missing outputs, empty completions, mismatched counts,
 mixed evaluation metrics, malformed references, or unavailable required HBM
-telemetry. There is no backend fallback, native-model path, retokenization, or
+telemetry. JSONL and profile data are written to temporary files and atomically
+renamed only after every batch, worker RPC, and scorer succeeds; a success
+marker binds their checksums. Failed runs cannot leave outputs that look
+complete. There is no backend fallback, native-model path, retokenization, or
 silent metric omission.
 
 ## Verification
