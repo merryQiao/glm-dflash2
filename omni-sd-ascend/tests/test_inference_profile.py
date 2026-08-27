@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import sys
+import types
 
 import pytest
 import yaml
@@ -17,8 +18,11 @@ from omni_sd.inference_profile import (
     component_availability,
     normalize_input_record,
     profile_batch_kind,
+    reduce_hbm_measurements,
     request_latency_seconds,
     score_prediction,
+    worker_reset_npu_peak,
+    worker_snapshot_npu_memory,
 )
 from omni_sd.vllm_ascend_generation import engine_kwargs, sampling_kwargs
 
@@ -323,6 +327,137 @@ def test_component_availability_distinguishes_loaded_from_timed():
         assert components[name]["executed"] is False
         assert components[name]["timing_available"] is False
         assert components[name]["reason"]
+
+
+def test_hbm_reduction_preserves_per_rank_current_and_batch_peak_semantics():
+    batches = [
+        [
+            {
+                "rank": 0,
+                "logical_device": 0,
+                "physical_device": 4,
+                "allocated_current_bytes": 100,
+                "reserved_current_bytes": 120,
+                "allocated_peak_bytes": 150,
+                "reserved_peak_bytes": 180,
+            },
+            {
+                "rank": 1,
+                "logical_device": 1,
+                "physical_device": 5,
+                "allocated_current_bytes": 200,
+                "reserved_current_bytes": 240,
+                "allocated_peak_bytes": 260,
+                "reserved_peak_bytes": 300,
+            },
+        ],
+        [
+            {
+                "rank": 0,
+                "logical_device": 0,
+                "physical_device": 4,
+                "allocated_current_bytes": 110,
+                "reserved_current_bytes": 130,
+                "allocated_peak_bytes": 170,
+                "reserved_peak_bytes": 190,
+            },
+            {
+                "rank": 1,
+                "logical_device": 1,
+                "physical_device": 5,
+                "allocated_current_bytes": 190,
+                "reserved_current_bytes": 230,
+                "allocated_peak_bytes": 250,
+                "reserved_peak_bytes": 290,
+            },
+        ],
+    ]
+
+    summary = reduce_hbm_measurements(batches, tensor_parallel_size=2)
+
+    assert summary["available"] is True
+    assert summary["source"] == "torch_npu_allocator"
+    assert summary["per_rank"]["0"]["final_current"]["allocated_bytes"] == 110
+    assert summary["per_rank"]["1"]["max_post_batch_current"][
+        "allocated_bytes"
+    ] == 200
+    assert summary["per_rank"]["0"]["max_batch_peak"]["allocated_bytes"] == 170
+    assert summary["max_rank_peak"]["allocated_bytes"] == 260
+    assert summary["max_batch_sum_of_rank_peaks"]["allocated_bytes"] == 420
+    assert summary["max_batch_sum_of_rank_peaks"]["reserved_bytes"] == 480
+
+
+@pytest.mark.parametrize(
+    ("batches", "message"),
+    [
+        (
+            [[{"rank": 0, "physical_device": 4}]],
+            "exactly 2 worker ranks",
+        ),
+        (
+            [
+                [
+                    {"rank": 0, "physical_device": 4},
+                    {"rank": 1, "physical_device": 4},
+                ]
+            ],
+            "unique physical NPU",
+        ),
+    ],
+)
+def test_hbm_reduction_rejects_partial_or_duplicate_workers(batches, message):
+    with pytest.raises(ProfileContractError, match=message):
+        reduce_hbm_measurements(batches, tensor_parallel_size=2)
+
+
+def test_worker_hbm_rpc_uses_rank_local_torch_npu_allocator(monkeypatch):
+    class FakeNPU:
+        def __init__(self):
+            self.reset_calls = []
+            self.sync_calls = []
+
+        def current_device(self):
+            return 1
+
+        def synchronize(self, device=None):
+            self.sync_calls.append(device)
+
+        def reset_peak_memory_stats(self, device=None):
+            self.reset_calls.append(device)
+
+        def memory_allocated(self, device=None):
+            return 101
+
+        def memory_reserved(self, device=None):
+            return 202
+
+        def max_memory_allocated(self, device=None):
+            return 303
+
+        def max_memory_reserved(self, device=None):
+            return 404
+
+    fake_npu = FakeNPU()
+    fake_dist = types.SimpleNamespace(is_initialized=lambda: True, get_rank=lambda: 1)
+    fake_torch = types.SimpleNamespace(npu=fake_npu, distributed=fake_dist)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "4,7")
+
+    reset = worker_reset_npu_peak(object())
+    snapshot = worker_snapshot_npu_memory(object())
+
+    assert reset == {"rank": 1, "logical_device": 1, "physical_device": 7}
+    assert fake_npu.reset_calls == [1]
+    assert snapshot == {
+        "rank": 1,
+        "logical_device": 1,
+        "physical_device": 7,
+        "allocated_current_bytes": 101,
+        "reserved_current_bytes": 202,
+        "allocated_peak_bytes": 303,
+        "reserved_peak_bytes": 404,
+    }
 
 
 def test_request_latency_prefers_vllm_metrics_and_falls_back():

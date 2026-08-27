@@ -6,12 +6,14 @@ import copy
 from collections import defaultdict
 import json
 import math
+import os
 from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping, Sequence
 import unicodedata
 
 from omni_sd.thinker_data import canonical_json
+from omni_sd.ascend_runtime import parse_visible_devices
 
 
 MEDIA_TYPES = ("audio", "image", "video")
@@ -28,6 +30,203 @@ MULTIPLE_CHOICE_PATTERN = re.compile(
 
 class ProfileContractError(ValueError):
     """Raised before reporting misleading inference performance."""
+
+
+HBM_FIELDS = (
+    "allocated_current_bytes",
+    "reserved_current_bytes",
+    "allocated_peak_bytes",
+    "reserved_peak_bytes",
+)
+
+
+def _worker_npu_context() -> tuple[Any, dict[str, int]]:
+    """Resolve rank-local torch_npu state inside a vLLM worker process."""
+
+    import torch
+    import torch_npu  # noqa: F401 - registers torch.npu in worker processes
+
+    distributed = getattr(torch, "distributed", None)
+    distributed_available = (
+        distributed is not None
+        and (
+            not hasattr(distributed, "is_available")
+            or distributed.is_available()
+        )
+    )
+    if (
+        distributed_available
+        and distributed.is_initialized()
+    ):
+        rank = int(distributed.get_rank())
+    else:
+        rank = int(os.environ.get("RANK", "0"))
+    logical_device = int(torch.npu.current_device())
+    visible_value = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if not visible_value:
+        raise ProfileContractError(
+            "ASCEND_RT_VISIBLE_DEVICES is required for physical NPU accounting"
+        )
+    try:
+        visible_devices = parse_visible_devices(visible_value)
+    except ValueError as error:
+        raise ProfileContractError(str(error)) from error
+    if logical_device >= len(visible_devices):
+        raise ProfileContractError(
+            "logical NPU index is outside ASCEND_RT_VISIBLE_DEVICES"
+        )
+    return torch, {
+        "rank": rank,
+        "logical_device": logical_device,
+        "physical_device": int(visible_devices[logical_device]),
+    }
+
+
+def worker_reset_npu_peak(_worker: Any) -> dict[str, int]:
+    """vLLM collective-RPC callback: reset this worker's allocator peak."""
+
+    torch, identity = _worker_npu_context()
+    torch.npu.synchronize(identity["logical_device"])
+    torch.npu.reset_peak_memory_stats(identity["logical_device"])
+    return identity
+
+
+def worker_snapshot_npu_memory(_worker: Any) -> dict[str, int]:
+    """vLLM collective-RPC callback: snapshot this worker's allocator state."""
+
+    torch, identity = _worker_npu_context()
+    device = identity["logical_device"]
+    torch.npu.synchronize(device)
+    return {
+        **identity,
+        "allocated_current_bytes": int(torch.npu.memory_allocated(device)),
+        "reserved_current_bytes": int(torch.npu.memory_reserved(device)),
+        "allocated_peak_bytes": int(torch.npu.max_memory_allocated(device)),
+        "reserved_peak_bytes": int(torch.npu.max_memory_reserved(device)),
+    }
+
+
+def _validated_hbm_batch(
+    snapshots: Sequence[Mapping[str, Any]], tensor_parallel_size: int
+) -> list[dict[str, int]]:
+    if len(snapshots) != tensor_parallel_size:
+        raise ProfileContractError(
+            f"HBM snapshot must contain exactly {tensor_parallel_size} worker ranks"
+        )
+    ranks = [int(snapshot["rank"]) for snapshot in snapshots if "rank" in snapshot]
+    physical = [
+        int(snapshot["physical_device"])
+        for snapshot in snapshots
+        if "physical_device" in snapshot
+    ]
+    if len(ranks) == tensor_parallel_size and len(set(ranks)) != tensor_parallel_size:
+        raise ProfileContractError("HBM snapshot worker ranks must be unique")
+    if (
+        len(physical) == tensor_parallel_size
+        and len(set(physical)) != tensor_parallel_size
+    ):
+        raise ProfileContractError(
+            "HBM snapshot workers must map to a unique physical NPU"
+        )
+    normalized: list[dict[str, int]] = []
+    for snapshot in snapshots:
+        required = ("rank", "logical_device", "physical_device", *HBM_FIELDS)
+        missing = [field for field in required if field not in snapshot]
+        if missing:
+            raise ProfileContractError(
+                f"HBM snapshot is missing fields: {', '.join(missing)}"
+            )
+        item = {field: int(snapshot[field]) for field in required}
+        if any(item[field] < 0 for field in required):
+            raise ProfileContractError("HBM snapshot values must be non-negative")
+        normalized.append(item)
+    ranks = [item["rank"] for item in normalized]
+    physical = [item["physical_device"] for item in normalized]
+    if len(set(ranks)) != tensor_parallel_size:
+        raise ProfileContractError("HBM snapshot worker ranks must be unique")
+    if len(set(physical)) != tensor_parallel_size:
+        raise ProfileContractError(
+            "HBM snapshot workers must map to a unique physical NPU"
+        )
+    return sorted(normalized, key=lambda item: item["rank"])
+
+
+def reduce_hbm_measurements(
+    batch_snapshots: Sequence[Sequence[Mapping[str, Any]]],
+    *,
+    tensor_parallel_size: int,
+) -> dict[str, Any]:
+    """Reduce rank-local allocator snapshots without conflating peak semantics."""
+
+    if tensor_parallel_size <= 0:
+        raise ProfileContractError("tensor_parallel_size must be positive")
+    if not batch_snapshots:
+        raise ProfileContractError("no HBM snapshots were collected")
+    batches = [
+        _validated_hbm_batch(batch, tensor_parallel_size)
+        for batch in batch_snapshots
+    ]
+    expected_mapping = {
+        item["rank"]: item["physical_device"] for item in batches[0]
+    }
+    for batch in batches[1:]:
+        mapping = {item["rank"]: item["physical_device"] for item in batch}
+        if mapping != expected_mapping:
+            raise ProfileContractError("HBM worker/device mapping changed between batches")
+
+    by_rank: dict[str, Any] = {}
+    for rank, physical_device in sorted(expected_mapping.items()):
+        samples = [
+            next(item for item in batch if item["rank"] == rank)
+            for batch in batches
+        ]
+        final = samples[-1]
+        by_rank[str(rank)] = {
+            "logical_device": final["logical_device"],
+            "physical_device": physical_device,
+            "final_current": {
+                "allocated_bytes": final["allocated_current_bytes"],
+                "reserved_bytes": final["reserved_current_bytes"],
+            },
+            "max_post_batch_current": {
+                "allocated_bytes": max(
+                    item["allocated_current_bytes"] for item in samples
+                ),
+                "reserved_bytes": max(
+                    item["reserved_current_bytes"] for item in samples
+                ),
+            },
+            "max_batch_peak": {
+                "allocated_bytes": max(item["allocated_peak_bytes"] for item in samples),
+                "reserved_bytes": max(item["reserved_peak_bytes"] for item in samples),
+            },
+        }
+
+    return {
+        "available": True,
+        "source": "torch_npu_allocator",
+        "tensor_parallel_size": tensor_parallel_size,
+        "batches_observed": len(batches),
+        "per_rank": by_rank,
+        "max_rank_peak": {
+            "allocated_bytes": max(
+                item["allocated_peak_bytes"] for batch in batches for item in batch
+            ),
+            "reserved_bytes": max(
+                item["reserved_peak_bytes"] for batch in batches for item in batch
+            ),
+        },
+        "max_batch_sum_of_rank_peaks": {
+            "allocated_bytes": max(
+                sum(item["allocated_peak_bytes"] for item in batch)
+                for batch in batches
+            ),
+            "reserved_bytes": max(
+                sum(item["reserved_peak_bytes"] for item in batch)
+                for batch in batches
+            ),
+        },
+    }
 
 
 def _as_list(value: Any) -> list[Any]:
