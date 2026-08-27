@@ -6,6 +6,8 @@ MODEL_PATH=${MODEL_PATH:?set MODEL_PATH}
 TRAJECTORY_JSONL=${TRAJECTORY_JSONL:-$ROOT/outputs/glm52_trajectories/trajectories-shard-0-of-1.jsonl}
 HIDDEN_OUTPUT_DIR=${HIDDEN_OUTPUT_DIR:-$ROOT/outputs/glm52_hidden_cache}
 
+echo "DEPRECATED: invoke scripts/generate_trajectories.sh and scripts/extract_hidden_sglang.sh independently" >&2
+
 # Stage A owns and shuts down its temporary HTTP server before returning.
 OUTPUT_JSONL="$TRAJECTORY_JSONL" MODEL_PATH="$MODEL_PATH" \
   bash "$ROOT/scripts/run_stage_a_trajectories.sh"

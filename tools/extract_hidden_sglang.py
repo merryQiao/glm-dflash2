@@ -30,6 +30,7 @@ from glm_dflash2.hidden_extraction import (  # noqa: E402
 from glm_dflash2.sglang_hidden_runner import (  # noqa: E402
     SGLangInternalHiddenRunner,
     one_batch_module,
+    validate_stage_b_server_args,
 )
 from glm_dflash2.provenance import local_model_fingerprint  # noqa: E402
 from glm_dflash2.target_io import model_revision, tokenizer_fingerprint  # noqa: E402
@@ -295,8 +296,12 @@ def main() -> int:
     server_args.disable_radix_cache = True
     server_args.chunked_prefill_size = -1
     server_args.max_running_requests = 1
+    # Validate the deterministic replay contract before resolve/load_model can
+    # allocate target weights or initialize the device runtime.
+    validate_stage_b_server_args(server_args)
     if hasattr(server_args, "resolve_once"):
         server_args.resolve_once()
+    validate_stage_b_server_args(server_args)
     _set_envs_and_config(server_args)
     layer_ids = tuple(int(value) for value in cli.capture_layer_ids.split(",") if value)
     if not layer_ids:
