@@ -21,6 +21,7 @@ from omni_sd.inference_profile import (
     reduce_hbm_measurements,
     request_latency_seconds,
     score_prediction,
+    validate_evaluation_contract,
     worker_reset_npu_peak,
     worker_snapshot_npu_memory,
 )
@@ -194,6 +195,22 @@ def test_evaluation_rejects_mixed_metrics():
     ]
     with pytest.raises(ProfileContractError, match="mixed evaluation metrics"):
         aggregate_evaluation(rows)
+
+
+def test_evaluation_contract_rejects_mixed_metrics_before_inference():
+    with pytest.raises(ProfileContractError, match="mixed evaluation metrics"):
+        validate_evaluation_contract(rows=[
+            {
+                "evaluation_json": json.dumps(
+                    {"metric": "exact_match", "reference": "yes"}
+                )
+            },
+            {
+                "evaluation_json": json.dumps(
+                    {"metric": "normalized_exact_match", "reference": "yes"}
+                )
+            },
+        ])
 
 
 def test_evaluation_is_unavailable_when_all_references_are_missing():
@@ -460,7 +477,7 @@ def test_worker_hbm_rpc_uses_rank_local_torch_npu_allocator(monkeypatch):
     }
 
 
-def test_request_latency_prefers_vllm_metrics_and_falls_back():
+def test_request_latency_uses_only_vllm_metrics_without_batch_fallback():
     class Metrics:
         arrival_time = 10.0
         finished_time = 10.75
@@ -468,8 +485,8 @@ def test_request_latency_prefers_vllm_metrics_and_falls_back():
     class Output:
         metrics = Metrics()
 
-    assert request_latency_seconds(Output(), 2.0) == pytest.approx(0.75)
-    assert request_latency_seconds(object(), 2.0) == pytest.approx(2.0)
+    assert request_latency_seconds(Output()) == pytest.approx(0.75)
+    assert request_latency_seconds(object()) is None
 
 
 def test_cli_dry_run_reuses_production_provider_without_importing_vllm(
@@ -538,10 +555,31 @@ def test_measured_profile_excludes_warmup_and_keeps_exact_ids(monkeypatch):
     class LLM:
         def __init__(self):
             self.calls = []
+            self.rpc_calls = []
 
         def generate(self, requests, sampling_params, use_tqdm):
             self.calls.append((requests, sampling_params, use_tqdm))
             return [Output() for _ in requests]
+
+        def collective_rpc(self, function):
+            self.rpc_calls.append(function.__name__)
+            if function.__name__ == "worker_reset_npu_peak":
+                return [
+                    {"rank": rank, "logical_device": rank, "physical_device": rank}
+                    for rank in range(4)
+                ]
+            return [
+                {
+                    "rank": rank,
+                    "logical_device": rank,
+                    "physical_device": rank,
+                    "allocated_current_bytes": 100 + rank,
+                    "reserved_current_bytes": 200 + rank,
+                    "allocated_peak_bytes": 300 + rank,
+                    "reserved_peak_bytes": 400 + rank,
+                }
+                for rank in range(4)
+            ]
 
     llm = LLM()
     monkeypatch.setattr(
@@ -555,10 +593,19 @@ def test_measured_profile_excludes_warmup_and_keeps_exact_ids(monkeypatch):
         "prepare_request",
         lambda row, _config, _processor: ({"prompt": row["condition_id"]}, []),
     )
+    ticks = iter(index / 10 for index in range(100))
+    monkeypatch.setattr(cli.time, "perf_counter", lambda: next(ticks))
 
     rows = [
         normalize_input_record(
-            {"id": f"row-{index}", "text": "hello"},
+            {
+                "id": f"row-{index}",
+                "text": "hello",
+                "evaluation": {
+                    "metric": "exact_match",
+                    "reference": "ok",
+                },
+            },
             index=index,
             base_dir=root,
         )
@@ -569,12 +616,152 @@ def test_measured_profile_excludes_warmup_and_keeps_exact_ids(monkeypatch):
     )
 
     assert len(llm.calls) == 2  # one warmup plus one measured batch
-    assert profile["performance"]["requests"] == 2
-    assert profile["performance"]["completion_tokens"] == 6
+    overall = profile["performance"]["overall"]
+    assert overall["requests"] == 2
+    assert overall["completion_tokens"] == 6
+    assert overall["preprocess_seconds"] == pytest.approx(0.2)
+    assert overall["engine_seconds"] == pytest.approx(0.1)
+    assert overall["end_to_end_seconds"] == pytest.approx(0.7)
+    assert profile["performance"]["warmup"]["engine_seconds"] == pytest.approx(0.1)
+    assert profile["performance"]["by_modality"]["text"]["requests"] == 2
+    assert profile["evaluation"]["overall"]["accuracy"] == 1.0
+    assert profile["components"]["talker"]["loaded"] is False
+    assert profile["memory"]["source"] == "torch_npu_allocator"
+    assert profile["memory"]["max_rank_peak"]["allocated_bytes"] == 303
+    assert profile["variant_identity"] == {"kind": "target_only"}
+    assert profile["comparison_identity"]["fingerprint"]
     assert [record["prompt_token_ids"] for record in records] == [[10, 11], [10, 11]]
     assert [record["response_token_ids"] for record in records] == [
         [20, 21, 151645],
         [20, 21, 151645],
     ]
+    assert all(record["evaluation_result"]["correct"] for record in records)
+    assert records[0]["preprocess_latency_ms"] == pytest.approx(100.0)
+    assert records[0]["request_engine_latency_ms"] == pytest.approx(250.0)
+    assert records[0]["batch_engine_latency_ms"] == pytest.approx(100.0)
+    assert records[0]["batch_end_to_end_latency_ms"] == pytest.approx(700.0)
+    assert llm.rpc_calls == ["worker_reset_npu_peak", "worker_snapshot_npu_memory"]
     measured_params = llm.calls[1][1]
     assert measured_params[0].kwargs["seed"] != measured_params[1].kwargs["seed"]
+
+    def unavailable_rpc(_function):
+        raise AttributeError("collective_rpc unavailable")
+
+    monkeypatch.setattr(llm, "collective_rpc", unavailable_rpc)
+    _, missing_hbm_profile = cli.run_profile(
+        complete_config(),
+        rows,
+        complete_config()["vllm_batch_size"],
+        warmup=0,
+        allow_missing_hbm=True,
+    )
+    assert missing_hbm_profile["memory"]["available"] is False
+    assert missing_hbm_profile["memory"]["source"] == "torch_npu_allocator"
+
+
+def _load_inference_cli():
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        f"omni_inference_cli_{id(root)}", root / "inference_qwen3-omni.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_comparison_identity_binds_local_media_bytes(tmp_path: Path):
+    cli = _load_inference_cli()
+    image = tmp_path / "image.bin"
+    image.write_bytes(b"first")
+    row = normalize_input_record(
+        {"id": "media", "text": "describe", "image": str(image)},
+        index=0,
+        base_dir=tmp_path,
+    )
+    arguments = {
+        "config": complete_config(),
+        "rows": [row],
+        "sizes": complete_config()["vllm_batch_size"],
+        "warmup": 1,
+        "runtime": {"visible_devices": [0, 1, 2, 3]},
+    }
+
+    first = cli._comparison_identity(**arguments)
+    image.write_bytes(b"second")
+    second = cli._comparison_identity(**arguments)
+
+    assert first["fingerprint"] != second["fingerprint"]
+
+
+def test_variant_manifest_is_structured_and_does_not_change_engine(tmp_path: Path):
+    cli = _load_inference_cli()
+    manifest = tmp_path / "variant.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "kind": "speculative",
+                "method": "dflash2",
+                "drafter_artifact_digest": "sha256:abc",
+                "adapter_version": "v1",
+                "speculative_config": {"num_speculative_tokens": 7},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert cli._variant_identity(None) == {"kind": "target_only"}
+    assert cli._variant_identity(manifest)["method"] == "dflash2"
+    assert engine_kwargs(complete_config()) == engine_kwargs(complete_config())
+
+
+def test_profile_bundle_publishes_checksum_marker_last(tmp_path: Path):
+    cli = _load_inference_cli()
+    output = tmp_path / "records.jsonl"
+    profile = tmp_path / "profile.json"
+    marker = tmp_path / "SUCCESS.json"
+
+    cli.write_profile_bundle(
+        output_jsonl=output,
+        profile_json=profile,
+        success_marker=marker,
+        records=[{"condition_id": "one"}],
+        profile={"status": "PASS"},
+    )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["status"] == "PASS"
+    assert payload["output_jsonl"]["sha256"] == cli._sha256_file(output)
+    assert payload["profile_json"]["sha256"] == cli._sha256_file(profile)
+
+
+def test_profile_bundle_failure_removes_all_final_artifacts(
+    tmp_path: Path, monkeypatch
+):
+    cli = _load_inference_cli()
+    output = tmp_path / "records.jsonl"
+    profile = tmp_path / "profile.json"
+    marker = tmp_path / "SUCCESS.json"
+    real_replace = cli.os.replace
+    calls = 0
+
+    def fail_second_replace(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected publish failure")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(cli.os, "replace", fail_second_replace)
+    with pytest.raises(OSError, match="injected"):
+        cli.write_profile_bundle(
+            output_jsonl=output,
+            profile_json=profile,
+            success_marker=marker,
+            records=[{"condition_id": "one"}],
+            profile={"status": "PASS"},
+        )
+
+    assert not output.exists()
+    assert not profile.exists()
+    assert not marker.exists()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,11 +30,21 @@ from omni_sd.ascend_runtime import runtime_identity  # noqa: E402
 from omni_sd.data_io import atomic_write_json  # noqa: E402
 from omni_sd.inference_profile import (  # noqa: E402
     ProfileContractError,
-    aggregate_performance,
+    aggregate_evaluation,
+    aggregate_profile_performance,
+    component_availability,
+    evaluation_result,
     normalize_input_record,
+    profile_batch_kind,
     profile_batches,
+    reduce_hbm_measurements,
     request_latency_seconds,
+    validate_evaluation_contract,
+    validate_hbm_worker_identities,
+    worker_reset_npu_peak,
+    worker_snapshot_npu_memory,
 )
+from omni_sd.thinker_data import stable_hex  # noqa: E402
 from omni_sd.thinker_generation import (  # noqa: E402
     DEFAULT_CONFIG,
     read_config,
@@ -67,6 +78,9 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs/qwen3_omni_thinker_profile.jsonl"),
     )
     parser.add_argument("--profile-json", type=Path)
+    parser.add_argument("--success-marker", type=Path)
+    parser.add_argument("--allow-missing-hbm", action="store_true")
+    parser.add_argument("--variant-manifest", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -127,7 +141,10 @@ def _parquet_rows(path: Path, limit: int | None) -> list[dict[str, Any]]:
     if missing:
         raise ProfileContractError(f"condition Parquet missing {sorted(missing)}")
     rows: list[dict[str, Any]] = []
-    for batch in parquet.iter_batches(columns=sorted(required), batch_size=256):
+    columns = sorted(required)
+    if "evaluation_json" in parquet.schema_arrow.names:
+        columns.append("evaluation_json")
+    for batch in parquet.iter_batches(columns=columns, batch_size=256):
         rows.extend(batch.to_pylist())
         if limit is not None and len(rows) >= limit:
             return rows[:limit]
@@ -178,33 +195,230 @@ def _generate(
     llm: Any,
     processor: Any,
     sampling_params_class: Any,
-) -> tuple[list[Any], float]:
-    prepared = [prepare_request(row, config, processor) for row in rows]
+) -> tuple[list[Any], dict[str, Any]]:
+    outer_started = time.perf_counter()
+    prepared: list[Any] = []
+    preprocess_seconds: list[float] = []
+    for row in rows:
+        preprocess_started = time.perf_counter()
+        prepared.append(prepare_request(row, config, processor))
+        preprocess_elapsed = time.perf_counter() - preprocess_started
+        if preprocess_elapsed <= 0:
+            raise RuntimeError("preprocessing clock did not advance")
+        preprocess_seconds.append(preprocess_elapsed)
     params = [
         sampling_params_class(**sampling_kwargs(config, str(row["condition_id"])))
         for row in rows
     ]
-    started = time.perf_counter()
+    engine_started = time.perf_counter()
     outputs = llm.generate(
         [request for request, _ in prepared],
         sampling_params=params,
         use_tqdm=False,
     )
-    elapsed = time.perf_counter() - started
-    if elapsed <= 0 or len(outputs) != len(rows):
+    engine_seconds = time.perf_counter() - engine_started
+    end_to_end_seconds = time.perf_counter() - outer_started
+    if engine_seconds <= 0 or end_to_end_seconds <= 0 or len(outputs) != len(rows):
         raise RuntimeError(f"vLLM returned {len(outputs)}/{len(rows)} requests")
-    return list(outputs), elapsed
+    return list(outputs), {
+        "preprocess_request_seconds": preprocess_seconds,
+        "preprocess_seconds": sum(preprocess_seconds),
+        "engine_seconds": engine_seconds,
+        "end_to_end_seconds": end_to_end_seconds,
+    }
 
 
-def atomic_write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_profile_bundle(
+    *,
+    output_jsonl: Path,
+    profile_json: Path,
+    success_marker: Path,
+    records: Iterable[dict[str, Any]],
+    profile: dict[str, Any],
+) -> None:
+    """Publish results together; the checksum marker is the completion gate."""
+
+    targets = (output_jsonl, profile_json, success_marker)
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    suffix = f".{os.getpid()}.tmp"
+    output_tmp = output_jsonl.with_name(f".{output_jsonl.name}{suffix}")
+    profile_tmp = profile_json.with_name(f".{profile_json.name}{suffix}")
+    marker_tmp = success_marker.with_name(f".{success_marker.name}{suffix}")
+    temporaries = (output_tmp, profile_tmp, marker_tmp)
+    published: list[Path] = []
+    backups: dict[Path, Path] = {}
+    try:
+        with output_tmp.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(
+                    json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        with profile_tmp.open("w", encoding="utf-8") as handle:
+            json.dump(profile, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        marker = {
+            "status": "PASS",
+            "output_jsonl": {
+                "path": str(output_jsonl.resolve()),
+                "sha256": _sha256_file(output_tmp),
+            },
+            "profile_json": {
+                "path": str(profile_json.resolve()),
+                "sha256": _sha256_file(profile_tmp),
+            },
+        }
+        with marker_tmp.open("w", encoding="utf-8") as handle:
+            json.dump(marker, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        for target in targets:
+            if target.exists():
+                backup = target.with_name(f".{target.name}{suffix}.backup")
+                os.replace(target, backup)
+                backups[target] = backup
+        for temporary, target in (
+            (output_tmp, output_jsonl),
+            (profile_tmp, profile_json),
+            (marker_tmp, success_marker),
+        ):
+            os.replace(temporary, target)
+            published.append(target)
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
+    except BaseException:
+        for target in published:
+            target.unlink(missing_ok=True)
+        for target, backup in backups.items():
+            if backup.exists():
+                os.replace(backup, target)
+        raise
+    finally:
+        for temporary in temporaries:
+            temporary.unlink(missing_ok=True)
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
+
+
+def _variant_identity(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {"kind": "target_only"}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "kind",
+        "method",
+        "drafter_artifact_digest",
+        "adapter_version",
+        "speculative_config",
+    }
+    if not isinstance(value, dict) or set(value).difference(required):
+        raise ProfileContractError("variant manifest contains unsupported fields")
+    missing = required.difference(value)
+    if missing or value.get("kind") != "speculative":
+        raise ProfileContractError(
+            f"invalid speculative variant manifest; missing={sorted(missing)}"
+        )
+    if not isinstance(value["speculative_config"], dict):
+        raise ProfileContractError("speculative_config must be a mapping")
+    return {key: value[key] for key in sorted(required)}
+
+
+def _media_inventory(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    inventory: list[dict[str, Any]] = []
+    for row in rows:
+        media_values: list[tuple[str, str]] = []
+        for item in json.loads(str(row.get("media_json", "[]"))):
+            if isinstance(item, dict):
+                media_values.append(
+                    (str(item.get("type", "")), str(item.get("path", "")))
+                )
+        for message in json.loads(str(row.get("messages_json", "[]"))):
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                media_type = str(item.get("type", ""))
+                if media_type in {"audio", "image", "video"}:
+                    media_values.append(
+                        (media_type, str(item.get(media_type, "")))
+                    )
+        for media_type, value in media_values:
+            if value.startswith(("http://", "https://")):
+                raise ProfileContractError(
+                    "strict comparison identity requires materialized local media"
+                )
+            if value.startswith("data:"):
+                payload = value.encode("utf-8")
+                inventory.append(
+                    {
+                        "condition_id": str(row["condition_id"]),
+                        "type": media_type,
+                        "size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+                continue
+            path = Path(value.removeprefix("file://"))
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            inventory.append(
+                {
+                    "condition_id": str(row["condition_id"]),
+                    "type": media_type,
+                    "size": path.stat().st_size,
+                    "sha256": _sha256_file(path),
+                }
+            )
+    return inventory
+
+
+def _comparison_identity(
+    *,
+    config: dict[str, Any],
+    rows: list[dict[str, Any]],
+    sizes: dict[str, int],
+    warmup: int,
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    batch_ids = [
+        [str(row["condition_id"]) for row in batch]
+        for batch in profile_batches(rows, sizes)
+    ]
+    payload = {
+        "contract": "omni_vllm_profile_v1",
+        "model": config["model"],
+        "generation": config["generation"],
+        "engine": engine_kwargs(config),
+        "runtime": runtime,
+        "rows": rows,
+        "media_artifacts": _media_inventory(rows),
+        "batch_condition_ids": batch_ids,
+        "sampling": [
+            sampling_kwargs(config, str(row["condition_id"])) for row in rows
+        ],
+        "warmup": warmup,
+        "measurement_rounds": 1,
+    }
+    return {
+        "contract": payload["contract"],
+        "fingerprint": stable_hex(payload),
+        "measurement_rounds": 1,
+    }
 
 
 def dry_run_profile(
@@ -229,64 +443,149 @@ def run_profile(
     rows: list[dict[str, Any]],
     sizes: dict[str, int],
     warmup: int,
+    *,
+    allow_missing_hbm: bool = False,
+    variant_manifest: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    validate_evaluation_contract(rows)
     identity = runtime_identity(hardware=str(config["runtime"]["hardware"]))
     expected_devices = int(config["runtime"]["tensor_parallel_size"])
     if len(identity["visible_devices"]) != expected_devices:
-        raise RuntimeError("visible Ascend device count must equal tensor_parallel_size")
+        raise RuntimeError(
+            "visible Ascend device count must equal tensor_parallel_size"
+        )
+    comparison_identity = _comparison_identity(
+        config=config,
+        rows=rows,
+        sizes=sizes,
+        warmup=warmup,
+        runtime=identity,
+    )
+    variant_identity = _variant_identity(variant_manifest)
 
     load_started = time.perf_counter()
     llm, processor, sampling_params_class = load_engine(config)
     model_load_seconds = time.perf_counter() - load_started
 
-    warmup_seconds = 0.0
+    warmup_measurements = {
+        "preprocess_seconds": 0.0,
+        "engine_seconds": 0.0,
+        "end_to_end_seconds": 0.0,
+    }
     for _ in range(warmup):
-        _, elapsed = _generate(
+        _, measurement = _generate(
             [rows[0]], config, llm, processor, sampling_params_class
         )
-        warmup_seconds += elapsed
+        for key in warmup_measurements:
+            warmup_measurements[key] += float(measurement[key])
 
     records: list[dict[str, Any]] = []
-    prompt_tokens: list[int] = []
-    completion_tokens: list[int] = []
-    request_seconds: list[float] = []
-    measured_batches: list[float] = []
+    request_measurements: list[dict[str, Any]] = []
+    batch_measurements: list[dict[str, Any]] = []
+    hbm_snapshots: list[list[dict[str, Any]]] = []
+    hbm_error: str | None = None
     eos = int(config["generation"]["eos_token_id"])
     for batch_index, batch in enumerate(profile_batches(rows, sizes)):
-        outputs, elapsed = _generate(
+        try:
+            reset_identities = llm.collective_rpc(worker_reset_npu_peak)
+            validate_hbm_worker_identities(reset_identities, expected_devices)
+        except Exception as error:
+            if not allow_missing_hbm:
+                raise RuntimeError("required vLLM worker HBM reset failed") from error
+            hbm_error = f"worker HBM reset unavailable: {type(error).__name__}: {error}"
+        outputs, measurement = _generate(
             batch, config, llm, processor, sampling_params_class
         )
-        measured_batches.append(elapsed)
-        for row, output in zip(batch, outputs, strict=True):
+        modality = profile_batch_kind(batch[0])
+        batch_measurements.append(
+            {
+                "batch_index": batch_index,
+                "modality": modality,
+                "requests": len(batch),
+                "engine_seconds": measurement["engine_seconds"],
+                "end_to_end_seconds": measurement["end_to_end_seconds"],
+            }
+        )
+        if hbm_error is None:
+            try:
+                hbm_snapshots.append(
+                    list(llm.collective_rpc(worker_snapshot_npu_memory))
+                )
+            except Exception as error:
+                if not allow_missing_hbm:
+                    raise RuntimeError(
+                        "required vLLM worker HBM snapshot failed"
+                    ) from error
+                hbm_error = (
+                    f"worker HBM snapshot unavailable: {type(error).__name__}: {error}"
+                )
+                hbm_snapshots.clear()
+        for request_index, (row, output) in enumerate(
+            zip(batch, outputs, strict=True)
+        ):
             payload = completion_payload(output, eos)
-            latency = request_latency_seconds(output, elapsed)
-            prompt_tokens.append(int(payload["prompt_tokens"]))
-            completion_tokens.append(int(payload["response_tokens"]))
-            request_seconds.append(latency)
+            request_latency = request_latency_seconds(output)
+            preprocess_elapsed = float(
+                measurement["preprocess_request_seconds"][request_index]
+            )
+            request_measurements.append(
+                {
+                    "condition_id": str(row["condition_id"]),
+                    "modality": modality,
+                    "prompt_tokens": int(payload["prompt_tokens"]),
+                    "completion_tokens": int(payload["response_tokens"]),
+                    "preprocess_seconds": preprocess_elapsed,
+                    "engine_request_seconds": request_latency,
+                    "batch_index": batch_index,
+                }
+            )
+            row_evaluation = evaluation_result(
+                row.get("evaluation_json"), str(payload["response_text"])
+            )
             records.append(
                 {
                     "condition_id": str(row["condition_id"]),
-                    "modality": str(row["modality"]),
+                    "modality": modality,
                     "response_text": payload["response_text"],
                     "prompt_token_ids": payload["prompt_token_ids"],
                     "response_token_ids": payload["response_token_ids"],
                     "prompt_tokens": payload["prompt_tokens"],
                     "response_tokens": payload["response_tokens"],
                     "finish_reason": payload["finish_reason"],
-                    "request_latency_ms": latency * 1000.0,
+                    "evaluation_json": row.get("evaluation_json"),
+                    "evaluation_result": row_evaluation,
+                    "preprocess_latency_ms": preprocess_elapsed * 1000.0,
+                    "request_engine_latency_ms": (
+                        request_latency * 1000.0
+                        if request_latency is not None
+                        else None
+                    ),
                     "batch_index": batch_index,
-                    "batch_wall_ms": elapsed * 1000.0,
+                    "batch_engine_latency_ms": measurement["engine_seconds"] * 1000.0,
+                    "batch_end_to_end_latency_ms": measurement["end_to_end_seconds"]
+                    * 1000.0,
                 }
             )
 
-    performance = aggregate_performance(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        batch_seconds=measured_batches,
-        request_seconds=request_seconds,
+    performance = aggregate_profile_performance(
+        requests=request_measurements,
+        batches=batch_measurements,
         model_load_seconds=model_load_seconds,
-        warmup_seconds=warmup_seconds,
+        warmup=warmup_measurements,
     )
+    if hbm_error is None:
+        memory = reduce_hbm_measurements(
+            hbm_snapshots,
+            tensor_parallel_size=expected_devices,
+        )
+    else:
+        memory = {
+            "available": False,
+            "source": "torch_npu_allocator",
+            "reason": hbm_error,
+        }
+    evaluation = aggregate_evaluation(records)
+    modalities = [str(request["modality"]) for request in request_measurements]
     profile = {
         "status": "PASS",
         "component": "thinker",
@@ -295,7 +594,12 @@ def run_profile(
         "generation": config["generation"],
         "engine": engine_kwargs(config),
         "runtime": identity,
+        "comparison_identity": comparison_identity,
+        "variant_identity": variant_identity,
         "performance": performance,
+        "memory": memory,
+        "evaluation": evaluation,
+        "components": component_availability(modalities),
     }
     return records, profile
 
@@ -305,16 +609,29 @@ def print_summary(profile: dict[str, Any]) -> None:
         print(json.dumps(profile, ensure_ascii=False, indent=2, sort_keys=True))
         return
     perf = profile["performance"]
+    overall = perf["overall"]
     print("Qwen3-Omni Thinker performance (vLLM-Ascend)")
-    print(f"  requests:                {perf['requests']}")
+    print(f"  requests:                {overall['requests']}")
     print(f"  model load:              {perf['model_load_seconds']:.3f} s")
-    print(f"  warmup:                  {perf['warmup_seconds']:.3f} s")
-    print(f"  measured:                {perf['measured_seconds']:.3f} s")
-    print(f"  completion throughput:   {perf['completion_tokens_per_second']:.3f} tok/s")
-    print(f"  total token throughput:  {perf['total_tokens_per_second']:.3f} tok/s")
-    print(f"  request throughput:      {perf['requests_per_second']:.3f} req/s")
-    print(f"  request latency p50/p95: {perf['request_latency_ms']['p50']:.3f} / "
-          f"{perf['request_latency_ms']['p95']:.3f} ms")
+    print(f"  warmup engine:           {perf['warmup']['engine_seconds']:.3f} s")
+    print(f"  measured engine:         {overall['engine_seconds']:.3f} s")
+    print(f"  measured end-to-end:     {overall['end_to_end_seconds']:.3f} s")
+    print(
+        "  engine completion TPS:   "
+        f"{overall['engine']['completion_tokens_per_second']:.3f}"
+    )
+    print(
+        "  end-to-end completion TPS: "
+        f"{overall['end_to_end']['completion_tokens_per_second']:.3f}"
+    )
+    latency = overall["request_engine_latency_ms"]
+    if latency["available"]:
+        print(
+            "  request engine p50/p95:  "
+            f"{latency['p50']:.3f} / {latency['p95']:.3f} ms"
+        )
+    else:
+        print("  request engine latency:  unavailable")
 
 
 def main() -> None:
@@ -324,7 +641,14 @@ def main() -> None:
     rows = load_rows(args)
     sizes = batch_sizes(config, args.batch_size)
     profile_path = args.profile_json or args.output_jsonl.with_suffix(".profile.json")
-    targets = [profile_path] if args.dry_run else [args.output_jsonl, profile_path]
+    success_marker = args.success_marker or profile_path.with_name(
+        f"{profile_path.name}.SUCCESS.json"
+    )
+    targets = (
+        [profile_path]
+        if args.dry_run
+        else [args.output_jsonl, profile_path, success_marker]
+    )
     if not args.overwrite:
         existing = [path for path in targets if path.exists()]
         if existing:
@@ -333,9 +657,23 @@ def main() -> None:
     if args.dry_run:
         profile = dry_run_profile(config, rows, sizes)
     else:
-        records, profile = run_profile(config, rows, sizes, args.warmup)
-        atomic_write_jsonl(args.output_jsonl, records)
-    atomic_write_json(profile_path, profile)
+        records, profile = run_profile(
+            config,
+            rows,
+            sizes,
+            args.warmup,
+            allow_missing_hbm=args.allow_missing_hbm,
+            variant_manifest=args.variant_manifest,
+        )
+        write_profile_bundle(
+            output_jsonl=args.output_jsonl,
+            profile_json=profile_path,
+            success_marker=success_marker,
+            records=records,
+            profile=profile,
+        )
+    if args.dry_run:
+        atomic_write_json(profile_path, profile)
     print_summary(profile)
     print(f"Profile: {profile_path.resolve()}")
     if not args.dry_run:

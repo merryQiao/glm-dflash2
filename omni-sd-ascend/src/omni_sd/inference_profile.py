@@ -106,9 +106,11 @@ def worker_snapshot_npu_memory(_worker: Any) -> dict[str, int]:
     }
 
 
-def _validated_hbm_batch(
+def validate_hbm_worker_identities(
     snapshots: Sequence[Mapping[str, Any]], tensor_parallel_size: int
 ) -> list[dict[str, int]]:
+    """Require one unique rank and physical NPU for every TP worker."""
+
     if len(snapshots) != tensor_parallel_size:
         raise ProfileContractError(
             f"HBM snapshot must contain exactly {tensor_parallel_size} worker ranks"
@@ -128,6 +130,22 @@ def _validated_hbm_batch(
         raise ProfileContractError(
             "HBM snapshot workers must map to a unique physical NPU"
         )
+    identities: list[dict[str, int]] = []
+    for snapshot in snapshots:
+        required = ("rank", "logical_device", "physical_device")
+        missing = [field for field in required if field not in snapshot]
+        if missing:
+            raise ProfileContractError(
+                f"HBM snapshot is missing fields: {', '.join(missing)}"
+            )
+        identities.append({field: int(snapshot[field]) for field in required})
+    return sorted(identities, key=lambda item: item["rank"])
+
+
+def _validated_hbm_batch(
+    snapshots: Sequence[Mapping[str, Any]], tensor_parallel_size: int
+) -> list[dict[str, int]]:
+    validate_hbm_worker_identities(snapshots, tensor_parallel_size)
     normalized: list[dict[str, int]] = []
     for snapshot in snapshots:
         required = ("rank", "logical_device", "physical_device", *HBM_FIELDS)
@@ -140,14 +158,6 @@ def _validated_hbm_batch(
         if any(item[field] < 0 for field in required):
             raise ProfileContractError("HBM snapshot values must be non-negative")
         normalized.append(item)
-    ranks = [item["rank"] for item in normalized]
-    physical = [item["physical_device"] for item in normalized]
-    if len(set(ranks)) != tensor_parallel_size:
-        raise ProfileContractError("HBM snapshot worker ranks must be unique")
-    if len(set(physical)) != tensor_parallel_size:
-        raise ProfileContractError(
-            "HBM snapshot workers must map to a unique physical NPU"
-        )
     return sorted(normalized, key=lambda item: item["rank"])
 
 
@@ -395,8 +405,8 @@ def _latency_summary(seconds: Sequence[float]) -> dict[str, float]:
     }
 
 
-def request_latency_seconds(output: Any, batch_seconds: float) -> float:
-    """Prefer vLLM request timestamps and fall back to enclosing batch time."""
+def request_latency_seconds(output: Any) -> float | None:
+    """Return vLLM's request latency, without inventing a batch fallback."""
 
     metrics = getattr(output, "metrics", None)
     arrival = getattr(metrics, "arrival_time", None)
@@ -405,9 +415,7 @@ def request_latency_seconds(output: Any, batch_seconds: float) -> float:
         elapsed = float(finished) - float(arrival)
         if elapsed > 0:
             return elapsed
-    if batch_seconds <= 0:
-        raise ProfileContractError("fallback batch latency must be positive")
-    return float(batch_seconds)
+    return None
 
 
 def _evaluation_payload(value: Any) -> dict[str, str] | None:
@@ -453,6 +461,38 @@ def score_prediction(metric: str, prediction: str, reference: str) -> bool:
     normalized_prediction = unicodedata.normalize("NFKC", prediction).upper().strip()
     match = MULTIPLE_CHOICE_PATTERN.fullmatch(normalized_prediction)
     return match is not None and match.group(1) == normalized_reference
+
+
+def evaluation_result(
+    evaluation_json: Any, prediction: str
+) -> dict[str, Any] | None:
+    """Return the serializable per-request v1 evaluation result."""
+
+    metadata = _evaluation_payload(evaluation_json)
+    if metadata is None:
+        return None
+    return {
+        "metric": metadata["metric"],
+        "correct": score_prediction(
+            metadata["metric"], prediction, metadata["reference"]
+        ),
+        "scorer_version": SCORE_VERSION,
+    }
+
+
+def validate_evaluation_contract(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Validate scorer metadata before any model allocation occurs."""
+
+    metrics: set[str] = set()
+    for row in rows:
+        metadata = _evaluation_payload(row.get("evaluation_json"))
+        if metadata is None:
+            continue
+        metrics.add(metadata["metric"])
+        if metadata["metric"] == "multiple_choice_accuracy":
+            score_prediction(metadata["metric"], "", metadata["reference"])
+    if len(metrics) > 1:
+        raise ProfileContractError("mixed evaluation metrics are not supported")
 
 
 def aggregate_evaluation(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
