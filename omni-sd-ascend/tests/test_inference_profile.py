@@ -12,10 +12,13 @@ import yaml
 from tests.helpers import complete_config
 from omni_sd.inference_profile import (
     ProfileContractError,
-    aggregate_performance,
+    aggregate_evaluation,
+    aggregate_profile_performance,
+    component_availability,
     normalize_input_record,
     profile_batch_kind,
     request_latency_seconds,
+    score_prediction,
 )
 from omni_sd.vllm_ascend_generation import engine_kwargs, sampling_kwargs
 
@@ -91,39 +94,235 @@ def test_multiple_native_images_use_conservative_multi_image_batch(tmp_path: Pat
     assert profile_batch_kind(row) == "multi_image"
 
 
-def test_aggregate_performance_excludes_load_and_warmup():
-    summary = aggregate_performance(
-        prompt_tokens=[10, 20],
-        completion_tokens=[5, 15],
-        batch_seconds=[1.0, 3.0],
-        request_seconds=[0.5, 2.5],
-        model_load_seconds=99.0,
-        warmup_seconds=11.0,
+def test_evaluation_metadata_survives_normalization_without_entering_messages(
+    tmp_path: Path,
+):
+    row = normalize_input_record(
+        {
+            "id": "evaluated",
+            "text": "Answer the question",
+            "evaluation": {
+                "metric": "normalized_exact_match",
+                "reference": "Café!",
+            },
+        },
+        index=0,
+        base_dir=tmp_path,
     )
 
-    assert summary["requests"] == 2
-    assert summary["prompt_tokens"] == 30
-    assert summary["completion_tokens"] == 20
-    assert summary["measured_seconds"] == 4.0
-    assert summary["requests_per_second"] == pytest.approx(0.5)
-    assert summary["completion_tokens_per_second"] == pytest.approx(5.0)
-    assert summary["total_tokens_per_second"] == pytest.approx(12.5)
+    assert json.loads(row["evaluation_json"]) == {
+        "metric": "normalized_exact_match",
+        "reference": "Café!",
+    }
+    assert "evaluation" not in json.loads(row["messages_json"])[0]
+
+
+@pytest.mark.parametrize(
+    ("metric", "prediction", "reference", "expected"),
+    [
+        ("exact_match", "Answer ", "Answer", False),
+        ("exact_match", "Answer", "Answer", True),
+        ("normalized_exact_match", "  CAFÉ—test! ", "cafe\u0301 test", True),
+        ("multiple_choice_accuracy", "B", "B", True),
+        ("multiple_choice_accuracy", "Answer: b.", "B", True),
+        ("multiple_choice_accuracy", "I choose B", "B", False),
+    ],
+)
+def test_omni_eval_v1_scoring(metric, prediction, reference, expected):
+    assert score_prediction(metric, prediction, reference) is expected
+
+
+def test_multiple_choice_reference_must_be_one_ascii_letter():
+    with pytest.raises(ProfileContractError, match="ASCII A-Z"):
+        score_prediction("multiple_choice_accuracy", "A", "AA")
+
+
+def test_evaluation_aggregates_partial_references_and_unavailable_modality():
+    summary = aggregate_evaluation(
+        [
+            {
+                "modality": "text",
+                "response_text": "yes",
+                "evaluation_json": json.dumps(
+                    {"metric": "exact_match", "reference": "yes"}
+                ),
+            },
+            {
+                "modality": "text",
+                "response_text": "ignored",
+                "evaluation_json": None,
+            },
+            {
+                "modality": "image",
+                "response_text": "ignored",
+                "evaluation_json": None,
+            },
+        ]
+    )
+
+    assert summary["available"] is True
+    assert summary["metric"] == "exact_match"
+    assert summary["overall"] == {
+        "available": True,
+        "evaluated": 1,
+        "skipped": 2,
+        "correct": 1,
+        "accuracy": 1.0,
+    }
+    assert summary["by_modality"]["text"]["evaluated"] == 1
+    assert summary["by_modality"]["text"]["skipped"] == 1
+    assert summary["by_modality"]["image"] == {
+        "available": False,
+        "evaluated": 0,
+        "skipped": 1,
+        "reason": "no evaluation references",
+    }
+
+
+def test_evaluation_rejects_mixed_metrics():
+    rows = [
+        {
+            "modality": "text",
+            "response_text": "x",
+            "evaluation_json": json.dumps({"metric": metric, "reference": "x"}),
+        }
+        for metric in ("exact_match", "normalized_exact_match")
+    ]
+    with pytest.raises(ProfileContractError, match="mixed evaluation metrics"):
+        aggregate_evaluation(rows)
+
+
+def test_evaluation_is_unavailable_when_all_references_are_missing():
+    summary = aggregate_evaluation(
+        [{"modality": "text", "response_text": "x", "evaluation_json": None}]
+    )
+    assert summary == {
+        "available": False,
+        "scorer_version": "omni_eval_v1",
+        "evaluated": 0,
+        "skipped": 1,
+        "reason": "no evaluation references",
+    }
+
+
+def test_profile_performance_uses_weighted_engine_and_end_to_end_denominators():
+    summary = aggregate_profile_performance(
+        requests=[
+            {
+                "modality": "text",
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "preprocess_seconds": 0.1,
+                "engine_request_seconds": 0.5,
+            },
+            {
+                "modality": "audio",
+                "prompt_tokens": 20,
+                "completion_tokens": 15,
+                "preprocess_seconds": 0.3,
+                "engine_request_seconds": None,
+            },
+        ],
+        batches=[
+            {
+                "modality": "text",
+                "requests": 1,
+                "engine_seconds": 1.0,
+                "end_to_end_seconds": 1.2,
+            },
+            {
+                "modality": "audio",
+                "requests": 1,
+                "engine_seconds": 3.0,
+                "end_to_end_seconds": 3.5,
+            },
+        ],
+        model_load_seconds=99.0,
+        warmup={
+            "preprocess_seconds": 1.0,
+            "engine_seconds": 9.0,
+            "end_to_end_seconds": 11.0,
+        },
+    )
+
+    overall = summary["overall"]
+    assert overall["requests"] == 2
+    assert overall["prompt_tokens"] == 30
+    assert overall["completion_tokens"] == 20
+    assert overall["engine_seconds"] == 4.0
+    assert overall["end_to_end_seconds"] == 4.7
+    assert overall["requests_per_second"] == pytest.approx(0.5)
+    assert overall["completion_tokens_per_second"] == pytest.approx(5.0)
+    assert overall["total_tokens_per_second"] == pytest.approx(12.5)
+    assert overall["engine"]["completion_tokens_per_second"] == pytest.approx(5.0)
+    assert overall["end_to_end"]["completion_tokens_per_second"] == pytest.approx(
+        20 / 4.7
+    )
+    assert overall["request_preprocess_latency_ms"]["mean"] == pytest.approx(200)
+    assert overall["request_engine_latency_ms"]["available"] is True
+    assert overall["request_engine_latency_ms"]["observed"] == 1
+    assert overall["request_engine_latency_ms"]["missing"] == 1
+    assert summary["by_modality"]["text"]["completion_tokens_per_second"] == 5.0
+    assert summary["by_modality"]["audio"][
+        "completion_tokens_per_second"
+    ] == 5.0
     assert summary["model_load_seconds"] == 99.0
-    assert summary["warmup_seconds"] == 11.0
-    assert summary["batch_latency_ms"]["p50"] == pytest.approx(2000.0)
-    assert summary["request_latency_ms"]["p95"] == pytest.approx(2400.0)
+    assert summary["warmup"]["end_to_end_seconds"] == 11.0
+    assert overall["batch_engine_latency_ms"]["p50"] == pytest.approx(2000.0)
+    assert overall["batch_end_to_end_latency_ms"]["p50"] == pytest.approx(2350.0)
 
 
 def test_empty_measurement_is_rejected():
     with pytest.raises(ProfileContractError, match="no measured requests"):
-        aggregate_performance(
-            prompt_tokens=[],
-            completion_tokens=[],
-            batch_seconds=[],
-            request_seconds=[],
+        aggregate_profile_performance(
+            requests=[],
+            batches=[],
             model_load_seconds=1.0,
-            warmup_seconds=0.0,
+            warmup={
+                "preprocess_seconds": 0.0,
+                "engine_seconds": 0.0,
+                "end_to_end_seconds": 0.0,
+            },
         )
+
+
+def test_actual_payload_classifies_every_supported_batch_kind(tmp_path: Path):
+    paths = {}
+    for media_type, suffix in (("image", "jpg"), ("audio", "wav"), ("video", "mp4")):
+        path = tmp_path / f"sample.{suffix}"
+        path.write_bytes(media_type.encode())
+        paths[media_type] = str(path)
+
+    def row(**media):
+        return normalize_input_record(
+            {"text": "inspect", **media}, index=0, base_dir=tmp_path
+        )
+
+    assert profile_batch_kind(row()) == "text"
+    assert profile_batch_kind(row(image=paths["image"])) == "image"
+    assert profile_batch_kind(row(image=[paths["image"], paths["image"]])) == "multi_image"
+    assert profile_batch_kind(row(audio=paths["audio"])) == "audio"
+    assert profile_batch_kind(row(video=paths["video"])) == "video"
+    assert profile_batch_kind(
+        row(image=paths["image"], audio=paths["audio"])
+    ) == "other"
+
+
+def test_component_availability_distinguishes_loaded_from_timed():
+    components = component_availability(["text", "audio", "image", "video"])
+    assert components["audio_encoder"] == {
+        "loaded": True,
+        "executed": True,
+        "timing_available": False,
+        "reason": "vLLM-Ascend does not expose request-scoped audio encoder events",
+    }
+    assert components["vision_encoder"]["executed"] is True
+    assert components["thinker"]["executed"] is True
+    for name in ("talker", "mtp", "code2wav"):
+        assert components[name]["loaded"] is False
+        assert components[name]["executed"] is False
+        assert components[name]["timing_available"] is False
+        assert components[name]["reason"]
 
 
 def test_request_latency_prefers_vllm_metrics_and_falls_back():
