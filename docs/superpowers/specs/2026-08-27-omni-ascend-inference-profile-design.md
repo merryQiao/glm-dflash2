@@ -70,9 +70,11 @@ total_tps      = sum(prompt_token_count + response_token_count)
                  / sum(relevant_batch_seconds)
 ```
 
-`engine_*` uses engine batch seconds and `end_to_end_*` uses preprocessing plus
-engine batch seconds. Prompt and response counts come only from exact vLLM
-token IDs.
+`engine_*` uses `sum(batch.engine_seconds)`. `end_to_end_*` always uses the
+separately measured outer `sum(batch.end_to_end_seconds)`; the sum of the
+preprocessing and engine sub-timers is diagnostic only and never serves as a
+denominator because it excludes call-boundary and batch-assembly overhead.
+Prompt and response counts come only from exact vLLM token IDs.
 
 ## Modality aggregation
 
@@ -93,7 +95,9 @@ therefore queried on all vLLM workers via `LLM.collective_rpc`:
   measured batch;
 - synchronize and read current/peak allocated and reserved bytes immediately
   after that batch;
-- retain each rank's largest batch peak, the largest rank peak, and
+- retain each batch/rank post-batch current value, each rank's largest batch
+  peak, `final_current` from the final measured batch,
+  `max_post_batch_current`, the largest rank peak, and
   `max_batch_sum_of_rank_peaks`.
 
 The report labels these values `torch_npu_allocator`; they are not device-wide
@@ -126,9 +130,9 @@ The frozen scorer version is `omni_eval_v1`:
   Unicode punctuation category (`P*`) with one space, collapse all Unicode
   whitespace runs to one ASCII space, and strip leading/trailing whitespace.
 - `multiple_choice_accuracy`: the reference is exactly one ASCII letter A-Z.
-  Apply NFKC and uppercase to the prediction, then select its first standalone
-  ASCII A-Z token using the regex `(?<![A-Z])[A-Z](?![A-Z])`; no match is
-  incorrect.
+  Apply NFKC, uppercase, and outer-whitespace stripping to the prediction. It
+  must fully match `^(?:ANSWER\s*[:=]\s*|OPTION\s+)?([A-Z])(?:[.)])?$`;
+  otherwise it is incorrect. Natural-language letter search is forbidden.
 
 Evaluation metadata survives normalization but is never passed into the model
 request. The report contains overall and per-modality accuracy plus evaluated
@@ -148,7 +152,9 @@ The top-level profile contains:
 
 - runtime/model/engine/sampling identity;
 - `performance.overall` and `performance.by_modality`;
-- `memory` with availability, source, per-rank peaks, max-rank and TP-sum;
+- `memory` with availability, source, per-rank current/peak values and the
+  precisely named `max_batch_sum_of_rank_peaks`; this is a sum of per-rank
+  allocator peaks within one batch, not a simultaneously sampled TP HBM peak;
 - `evaluation` with availability, metric, overall and per-modality values;
 - `components` with availability and reasons for Audio Encoder, Vision
   Encoder, Thinker, Talker, MTP, and Code2Wav.
@@ -159,18 +165,33 @@ engine/end-to-end latency, and evaluation metadata/result when requested.
 
 ## Paired baseline/speculative comparison
 
-Each profile contains a versioned workload fingerprint over normalized request
-content, request order, computed batch boundaries, target model and revision,
-runtime/topology, sampling parameters, per-request seeds, warmup count, and
-measurement rounds. A baseline and speculative profile are pairable only when
-these fingerprints match.
+Each profile separates two identities:
 
-A strict latency/speedup comparison additionally requires identical request
-counts and per-request completion-token counts; greedy runs also require exact
-prompt and response token IDs. Any mismatch is recorded as ineligible rather
-than silently interpreted as speedup. Token-throughput reports may still show
-their independently normalized TPS, but the paired `speedup` field is withheld
-unless the strict eligibility checks pass.
+- `comparison_invariant_fingerprint`: target and processor revisions,
+  vLLM/vLLM-Ascend versions, hardware and TP/EP topology, normalized request
+  content and order, computed batch boundaries, sampling parameters,
+  per-request seeds, warmup, and measurement rounds. Local media are bound by
+  content digest and size, not path alone. When evaluation is enabled, this
+  also binds scorer version, metric, and reference digest.
+- `variant_identity`: `target_only` or the exact speculative method, drafter
+  export digest, adapter version, and speculative configuration.
+
+A baseline and speculative profile are pairable only when their comparison
+invariant fingerprints match and their variant identities differ only in the
+intended speculative system.
+
+A strict paired latency/speedup comparison additionally requires exact prompt
+and response token IDs for every request in every decoding mode. Different
+sampled token content can change context and MoE routing even at equal length.
+If identical sampled paths cannot be reproduced, each variant may report its
+independent throughput distribution, but paired speedup is ineligible.
+
+Paired measurements run on exclusive identical devices for at least three
+rounds. Execution order alternates target/speculative then
+speculative/target, with the same warmup policy before each variant. The report
+stores every round's engine and end-to-end speedup and summarizes them with
+median, median absolute deviation, minimum, and maximum; it never reports only
+one ratio of grand totals.
 
 ## Failure policy
 
