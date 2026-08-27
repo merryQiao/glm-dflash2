@@ -41,12 +41,17 @@ vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",position="0"} 9
 
     def test_comparison_reports_speedup_and_greedy_parity(self):
         baseline = {
+            "sampling": {"temperature": 0.0, "top_p": 1.0, "seed": 42, "max_tokens": 16},
+            "fixture_sha256": "fixture",
             "summary": {"completion_tokens": 200, "wall_seconds": 10.0, "tps": 20.0},
-            "samples": [{"sample_id": "a", "output_text": "same"}],
+            "samples": [{"sample_id": "a", "output_text": "same", "output_token_ids": [1, 2]}],
         }
         speculative = {
+            "sampling": {"temperature": 0.0, "top_p": 1.0, "seed": 42, "max_tokens": 16},
+            "fixture_sha256": "fixture",
+            "rejection_mode": "standard",
             "summary": {"completion_tokens": 200, "wall_seconds": 5.0, "tps": 40.0},
-            "samples": [{"sample_id": "a", "output_text": "same"}],
+            "samples": [{"sample_id": "a", "output_text": "same", "output_token_ids": [1, 2]}],
             "spec_decode": {
                 "mean_acceptance_length": 6.0,
                 "draft_acceptance_rate": 5 / 7,
@@ -62,25 +67,48 @@ vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",position="0"} 9
 
     def test_comparison_rejects_speculative_run_without_active_draft_metrics(self):
         baseline = {
+            "sampling": {"temperature": 0.0},
+            "fixture_sha256": "fixture",
             "summary": {"tps": 20.0},
-            "samples": [{"sample_id": "a", "output_text": "same"}],
+            "samples": [{"sample_id": "a", "output_text": "same", "output_token_ids": [1]}],
         }
         speculative = {
+            "sampling": {"temperature": 0.0},
+            "fixture_sha256": "fixture",
             "summary": {"tps": 24.0},
-            "samples": [{"sample_id": "a", "output_text": "same"}],
+            "samples": [{"sample_id": "a", "output_text": "same", "output_token_ids": [1]}],
         }
         with self.assertRaisesRegex(ValueError, "speculative run.*metrics"):
             compare_benchmark_results(
                 baseline, speculative, require_exact_outputs=True
             )
 
-    def test_launcher_uses_sequential_runs_and_blocks_unvalidated_glm_adapter(self):
+    def test_greedy_parity_uses_token_ids_not_text(self):
+        baseline = {
+            "sampling": {"temperature": 0.0},
+            "fixture_sha256": "fixture",
+            "summary": {"tps": 20.0},
+            "samples": [{"sample_id": "a", "output_text": "same", "output_token_ids": [1]}],
+        }
+        speculative = {
+            "sampling": {"temperature": 0.0},
+            "fixture_sha256": "fixture",
+            "rejection_mode": "standard",
+            "summary": {"tps": 24.0},
+            "samples": [{"sample_id": "a", "output_text": "same", "output_token_ids": [2]}],
+            "spec_decode": {"drafts": 1, "draft_tokens": 7, "accepted_tokens": 1,
+                            "mean_acceptance_length": 2, "draft_acceptance_rate": 1 / 7},
+        }
+        with self.assertRaisesRegex(ValueError, "token-ID"):
+            compare_benchmark_results(baseline, speculative, require_exact_outputs=True)
+
+    def test_launcher_uses_sequential_runs_and_requires_bound_attestation(self):
         root = Path(__file__).resolve().parents[1]
         script = (root / "scripts/eval_vllm_ascend.sh").read_text()
         self.assertIn('run_server "baseline"', script)
         self.assertIn('run_server "speculative"', script)
-        self.assertIn('custom-glm52-vllm-ascend-adapter-required', script)
-        self.assertIn('GLM-5.2 runtime adapter has not passed', script)
+        self.assertIn('validate-attestation', script)
+        self.assertIn('deploy_attestation.json', script)
         self.assertIn('--speculative-config', script)
         self.assertIn('ASCEND_RT_VISIBLE_DEVICES', script)
 

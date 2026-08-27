@@ -3,13 +3,15 @@ set -euo pipefail
 
 : "${TARGET_MODEL:?set TARGET_MODEL to the GLM-5.2 BF16 checkpoint}"
 : "${DRAFTER_EXPORT:?set DRAFTER_EXPORT to a training output/export directory}"
-: "${PROMPTS_JSONL:?set PROMPTS_JSONL to a fixed JSONL prompt set}"
 : "${OUT_DIR:?set OUT_DIR}"
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PY=${PY:-python}
+export PYTHONPATH="$ROOT/src:$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 VLLM_BIN=${VLLM_BIN:-vllm}
 TP_SIZE=${TP_SIZE:-16}
+EP_SIZE=${EP_SIZE:-$TP_SIZE}
+NNODES=${NNODES:-1}
 PORT=${PORT:-8000}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-GLM-5.2}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
@@ -22,7 +24,9 @@ TOP_P=${TOP_P:-1.0}
 SEED=${SEED:-42}
 WARMUP_REQUESTS=${WARMUP_REQUESTS:-2}
 SERVER_TIMEOUT=${SERVER_TIMEOUT:-1800}
-COMPILATION_CONFIG=${COMPILATION_CONFIG:-'{"cudagraph_mode":"PIECEWISE"}'}
+COMPILATION_CONFIG=${COMPILATION_CONFIG:-'{"cudagraph_mode":"NONE"}'}
+PROMPTS_JSONL=${PROMPTS:-${PROMPTS_JSONL:-}}
+: "${PROMPTS_JSONL:?set PROMPTS or PROMPTS_JSONL to a fixed JSONL prompt set}"
 mkdir -p "${OUT_DIR}"
 
 readarray -t export_fields < <("${PY}" - "${DRAFTER_EXPORT}" <<'PY'
@@ -31,18 +35,18 @@ from pathlib import Path
 root = Path(sys.argv[1])
 manifest = json.loads((root / "export_manifest.json").read_text())
 config = json.loads((root / "config.json").read_text())
-print(manifest["runtime_compatibility"])
+print(manifest["status"])
 print(manifest["method"])
 print(manifest["num_speculative_tokens"])
 print(config["speculators_config"]["algorithm"])
 PY
 )
-RUNTIME_COMPATIBILITY=${export_fields[0]}
+EXPORT_STATUS=${export_fields[0]}
 METHOD=${export_fields[1]}
 NUM_SPECULATIVE_TOKENS=${export_fields[2]}
 ALGORITHM=${export_fields[3]}
-if [[ "${RUNTIME_COMPATIBILITY}" == "custom-glm52-vllm-ascend-adapter-required" ]]; then
-  echo "GLM-5.2 runtime adapter has not passed its offline/runtime parity gate; serving is intentionally blocked." >&2
+if [[ "${EXPORT_STATUS}" != "runtime-attested" || ! -f "${DRAFTER_EXPORT}/deploy_attestation.json" ]]; then
+  echo "Drafter export is not bound to a passing vLLM-Ascend deploy attestation." >&2
   exit 2
 fi
 if [[ "${METHOD}" != "${ALGORITHM}" ]]; then
@@ -53,6 +57,20 @@ if (( NUM_SPECULATIVE_TOKENS > 15 )); then
   echo "vLLM-Ascend requires num_speculative_tokens + 1 <= 16" >&2
   exit 2
 fi
+
+ACTIVE_RUNTIME_JSON="${OUT_DIR}/active_runtime_identity.json"
+"${PY}" "${ROOT}/tools/attest_vllm_ascend_export.py" collect-runtime \
+  --output "${ACTIVE_RUNTIME_JSON}" \
+  --tp-size "${TP_SIZE}" \
+  --ep-size "${EP_SIZE}" \
+  --nnodes "${NNODES}" \
+  --attention-backend "${ATTENTION_BACKEND:-ascend}" \
+  --model-runner "${MODEL_RUNNER:-v1}" \
+  --graph-mode disabled
+"${PY}" "${ROOT}/tools/attest_vllm_ascend_export.py" validate-attestation \
+  --export "${DRAFTER_EXPORT}" \
+  --runtime-identity "${ACTIVE_RUNTIME_JSON}" \
+  >"${OUT_DIR}/attestation-validation.json"
 
 if [[ -z "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
   ASCEND_RT_VISIBLE_DEVICES=$(seq -s, 0 $((TP_SIZE - 1)))
@@ -103,7 +121,16 @@ run_server() {
     local speculative_config
     speculative_config=$("${PY}" - "${METHOD}" "${DRAFTER_EXPORT}" "${NUM_SPECULATIVE_TOKENS}" <<'PY'
 import json, sys
-print(json.dumps({"method": sys.argv[1], "model": sys.argv[2], "num_speculative_tokens": int(sys.argv[3])}))
+method, model, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+value = {"method": method, "model": model, "num_speculative_tokens": count}
+if method == "dflash2":
+    value = {
+        "method": "custom_class",
+        "model": model,
+        "num_speculative_tokens": count,
+        "custom_speculator": "integrations.vllm_ascend.dflash2_proposer.DFlash2Proposer",
+    }
+print(json.dumps(value))
 PY
 )
     command+=(--speculative-config "${speculative_config}")
@@ -120,6 +147,8 @@ PY
 
 run_benchmark() {
   local mode=$1
+  local rejection_mode=none
+  if [[ "${mode}" == speculative ]]; then rejection_mode=standard; fi
   "${PY}" "${ROOT}/tools/benchmark_vllm_ascend.py" run \
     --base-url "http://127.0.0.1:${PORT}" \
     --model "${SERVED_MODEL_NAME}" \
@@ -131,7 +160,8 @@ run_benchmark() {
     --top-p "${TOP_P}" \
     --seed "${SEED}" \
     --warmup-requests "${WARMUP_REQUESTS}" \
-    --timeout "${SERVER_TIMEOUT}"
+    --timeout "${SERVER_TIMEOUT}" \
+    --rejection-mode "${rejection_mode}"
 }
 
 # Sequential launches are intentional: baseline and speculative runs use the
