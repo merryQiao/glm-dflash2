@@ -93,7 +93,9 @@ class TrainingLaunchersTest(unittest.TestCase):
             self.assertIn(value, readme)
         runbook = (ROOT / "docs/ASCEND_910B_RUNBOOK.md").read_text()
         self.assertIn("real 910B", runbook)
-        self.assertIn("train_glm52_drafter_910b.sh", runbook)
+        self.assertIn("scripts/train_drafter.sh", runbook)
+        self.assertIn("candidate-not-deployable", runbook)
+        self.assertIn("deploy_attestation.json", runbook)
         self.assertIn("Legacy v1", runbook)
 
 

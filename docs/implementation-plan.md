@@ -1,31 +1,43 @@
-# Implementation plan
+# Maintained implementation map
 
-The maintained plan is
-[`docs/superpowers/plans/2026-08-25-hidden-cache.md`](superpowers/plans/2026-08-25-hidden-cache.md).
-
-The offline training implementation plan is
+The data/cache design remains documented in
+[`docs/superpowers/plans/2026-08-25-hidden-cache.md`](superpowers/plans/2026-08-25-hidden-cache.md)
+and offline training in
 [`docs/superpowers/plans/2026-08-25-offline-glm-dflash2-training.md`](superpowers/plans/2026-08-25-offline-glm-dflash2-training.md).
+The current export/runtime implementation follows
+[`docs/superpowers/plans/2026-08-27-vllm-ascend-export-runtime.md`](superpowers/plans/2026-08-27-vllm-ascend-export-runtime.md).
 
-Implemented modules:
+The only production sequence is:
 
-- `agent_trajectory.py`, `vibe_coding.py`, `web_tools.py`: copied behavioral
-  baseline from the working SpecForge coding-agent generator;
-- `trajectory_tokens.py`: exact replay token/mask freeze;
-- `sglang_stage_a.py` and `tools/generate_trajectories.py`: GLM-5.2 rollout;
-- `sglang_hidden_runner.py` and `tools/extract_hidden_sglang.py`: selected-layer
-  SGLang internal teacher-forced pass;
-- `hidden_cache.py`: packed durable cache and DFlash training reader;
-- `tools/validate_hidden_cache.py`: integrity/shape/finite/parity validation and
-  immutable training attestation.
-- `target_io.py`: selective frozen embedding/LM-head extraction and provenance;
-- `dflash2_blocks.py`, `dflash2_objective.py`: exact anchors, masks and losses;
-- `chunked_lm_head.py`: exact two-axis chunked full-vocabulary projection;
-- `dflash2_model.py`: portable five-layer draft, dynamic conv and selector;
-- `offline_trainer.py`: cache-to-loss training forward with unregistered I/O;
-- `distributed.py`, `checkpointing.py`: HCCL/FSDP2 accumulation and exact resume;
-- `tools/train_drafter_offline.py`: the single DFlash/DFlash2/DSpark training
-  entrypoint and method-aware draft export.
+1. `scripts/generate_trajectories.sh`: SGLang Stage A sampled trajectories and
+   exact token IDs.
+2. `scripts/extract_hidden_sglang.sh`: SGLang Stage B teacher-forced replay and
+   schema-v2 hidden cache.
+3. `scripts/extract_glm52_io.sh`: immutable target embedding/LM-head artifact.
+4. `scripts/train_drafter.sh`: DFlash/DFlash2/DSpark offline training.
+5. Method-specific candidate export under `src/glm_dflash2/vllm_ascend/`.
+6. Real Ascend runtime parity and
+   `tools/attest_vllm_ascend_export.py attest`.
+7. `scripts/eval_vllm_ascend.sh`: serial target-only/speculative formal
+   evaluation using only the exact attested runtime.
 
-Remaining hardware gates are a real GLM-5.2 layer-capture identity check, a
-two-rank 910B optimizer/save/resume run, and tensor-by-tensor parity with the
-actual SGLang-on-Ascend DFlash2 loader.  CPU tests cannot substitute for them.
+New exports are immutable `candidate-not-deployable` artifacts. DFlash,
+DFlash2 and DSpark have distinct configs and weight contracts; DFlash2's
+runtime integration is isolated in `integrations/vllm_ascend/`. A candidate is
+deployable only after a machine-readable parity artifact binds its exact bytes
+to one fully pinned vLLM/vLLM-Ascend/Speculators/CANN runtime and creates
+`deploy_attestation.json`. Legacy schema-v1 exports are permanently untrusted.
+
+The remaining hardware gates cannot be completed locally:
+
+- Stage B varied-length and final-norm numerical parity on the production
+  SGLang/GLM-5.2 fork;
+- two-rank HCCL/FSDP2 optimizer/save/resume;
+- method-specific candidate load, logits, proposal IDs and intermediate
+  tensor parity in the exact vLLM-Ascend fork;
+- raw-token greedy equality, standard sampling rejection and positive
+  speculative counter deltas;
+- serial same-hardware TPS/latency measurement under the deployment topology.
+
+CPU smoke, matching key names, or a successfully written export must never be
+reported as proof that those real-hardware gates passed.

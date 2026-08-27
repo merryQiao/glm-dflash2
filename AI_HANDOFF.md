@@ -1,7 +1,7 @@
 # GLM-5.2 DFlash / DFlash2 / DSpark 服务器接管手册
 
-更新时间：2026-08-26
-仓库基线：`fix/stage-a-concurrency`，`d7b23bb fix: close production validation gaps`
+更新时间：2026-08-27
+仓库实现分支：`feature/vllm-ascend-export-runtime`
 
 > 这是服务器端 AI 的唯一接管入口。先完整读完本文，再看 `README.md` 和
 > `docs/ASCEND_910B_RUNBOOK.md` 中的命令细节。本文记录的是“当前真实状态”，不把
@@ -18,8 +18,10 @@ trajectory，完成一条可复现的统一实验链：
 3. 提取并冻结 target 的 `embed_tokens` 与 `lm_head`；
 4. 使用完全相同的 sample IDs、hidden cache 和 anchor 规则离线训练 DFlash、DFlash2、
    DSpark；
-5. 导出 serving artifact，接入实际 Ascend 推理框架；
-6. 串行测 target-only 与 speculative 的 acceptance length、TPS、speedup 和输出一致性。
+5. 分方法导出不可直接部署的 candidate，在真实 vLLM-Ascend 上完成 parity 并生成
+   deploy attestation；
+6. 只通过已 attested 的 artifact 串行测 target-only 与 speculative 的 acceptance
+   length、TPS、speedup 和输出一致性。
 
 预定的五组训练 setting：
 
@@ -44,9 +46,15 @@ physical block 的第一个位置是已知 anchor，不能把 B8/B16 错写成 8
 - target token I/O：提取 dense BF16/FP16/FP32 embedding 与 LM head，并记录 identity；
 - 统一数据与 anchor 构造：三个方法共享 cache row、sample ID、absolute position 和
   deterministic anchor；
-- 三种离线训练 objective、FSDP2、梯度累积、完整 checkpoint/resume、标准 export；
+- 三种离线训练 objective、FSDP2、梯度累积、完整 checkpoint/resume；
+- DFlash、DFlash2、DSpark 分离 exporter，candidate checksum/identity 绑定和 legacy-v1
+  永久不可信策略；
+- runtime identity、offline/runtime parity 结果和 candidate bytes 三方绑定的
+  `deploy_attestation.json`；
+- DFlash2 独立 vLLM-Ascend adapter 骨架，不伪装成普通 DFlash；
 - cache checksum、provenance、hidden parity gate、两 rank resume gate；
-- target-only/speculative 串行 benchmark 驱动和 acceptance/TPS 统计；
+- 仅接受 attested artifact 的 target-only/speculative 串行 benchmark，raw token ID greedy
+  parity、标准 rejection sampling 和 counter-delta acceptance/TPS 统计；
 - 旧的 vLLM response-only 数据生成入口已删除，生产路径只有 SGLang 两阶段方案。
 
 ### 2.2 本地能够证明的范围
@@ -58,10 +66,10 @@ physical block 的第一个位置是已知 anchor，不能把 B8/B16 错写成 8
 
 这些检查不能证明真实 910B kernel、HCCL、SGLang hidden hook 或 serving ABI 正确。
 
-2026-08-26 的最新验收记录：
+2026-08-27 的本分支验收记录：
 
 ```text
-unit tests                     202 passed
+unit tests                     226 passed
 all scripts bash -n            passed
 src/tools/tests compileall     passed
 git diff --check               passed
@@ -90,7 +98,8 @@ PY=/tmp/glm-dflash2-test-py312/bin/python bash scripts/smoke_no_model.sh
 - 真实 910B 上 Stage B hidden/logits 对 direct Transformers/官方路径的数值 parity；
 - 大规模 schema-v2 cache 正式生成；
 - 真实 910B FSDP2 多卡长跑和中断恢复；
-- DFlash/DFlash2/DSpark 的 **GLM-5.2 Ascend proposer adapter** 与 load/parity；
+- DFlash/DSpark 在目标 fork 中的实际 proposer load/parity，以及 DFlash2 adapter 与该
+  fork 的真实 ABI 对接；
 - 多节点 BF16 GLM-5.2 target-only/speculative 端到端 TPS 评测。
 
 ## 3. 不可更改的模型与数据契约
@@ -145,7 +154,8 @@ Stage B 中的 temperature=0 不表示重新 greedy 生成。Stage B 只沿 Stag
 
 主要文件：
 
-- `scripts/run_stage_a_trajectories.sh`
+- `scripts/generate_trajectories.sh`（推荐入口）；
+- `scripts/run_stage_a_trajectories.sh`（底层兼容 worker）；
 - `tools/generate_trajectories.py`
 - `src/glm_dflash2/agent_trajectory.py`
 - `src/glm_dflash2/sglang_stage_a.py`
@@ -200,7 +210,7 @@ WORKSPACE_CACHE=/shared/cache/vibe-workspaces \
 OPEN_SWE_STORE=/shared/data/open_swe_original.sqlite \
 OUTPUT_JSONL=/shared/out/trajectory-smoke.jsonl \
 WORKERS=4 MAX_RUNNING_REQUESTS=1 MAX_SAMPLES=50 \
-bash scripts/run_stage_a_trajectories.sh
+bash scripts/generate_trajectories.sh
 ```
 
 `WORKERS` 是 trajectory/tool/workspace 并发；`MAX_RUNNING_REQUESTS` 只限制本进程同时
@@ -228,7 +238,7 @@ Open-SWE 历史完整轨迹没有当时的 sampled token metadata，因此只能
 
 主要文件：
 
-- `scripts/run_stage_b_hidden.sh`
+- `scripts/extract_hidden_sglang.sh`
 - `tools/extract_hidden_sglang.py`
 - `src/glm_dflash2/sglang_hidden_runner.py`
 - `src/glm_dflash2/hidden_extraction.py`
@@ -257,7 +267,7 @@ TRAJECTORY_JSONL=/shared/out/trajectories-shard-0.jsonl \
 OUTPUT_DIR=/shared/out/hidden-v2-shard-0 \
 TP_SIZE=32 EP_SIZE=32 NNODES=2 NODE_RANK=0 \
 DIST_INIT_ADDR=<rank-0-host> NCCL_PORT=29500 \
-bash scripts/run_stage_b_hidden.sh
+bash scripts/extract_hidden_sglang.sh
 ```
 
 每个节点各运行一份，`NODE_RANK` 唯一。实际 TP/EP/节点数必须服从服务器已经验证的
@@ -378,12 +388,12 @@ OUTPUT_DIR=/shared/out/glm52-dflash2-b16 \
 MASK_TOKEN_ID=<真实 tokenizer/runtime ID> \
 PAD_TOKEN_ID=<真实 ID> \
 NUM_NPUS=8 \
-bash scripts/train_glm52_drafter_910b.sh
+bash scripts/train_drafter.sh
 ```
 
 入口：
 
-- `scripts/train_glm52_drafter_910b.sh`：唯一主 launcher；
+- `scripts/train_drafter.sh`：唯一推荐 launcher；
 - `tools/train_drafter_offline.py`：统一 CLI；
 - `scripts/train_glm52_dflash2_910b.sh`：仅为旧命令兼容 wrapper，不是另一套实现。
 
@@ -405,7 +415,7 @@ bash scripts/gate_train_2rank_910b.sh
 marker 存在、uninterrupted 与 resume 的下一步输出/状态一致。只从带 `COMPLETE` 标记的
 checkpoint 恢复；cache、method、architecture、optimizer、scheduler identity 不得改变。
 
-## 9. Export 不等于已经可 serving
+## 9. Candidate export 与 deploy attestation
 
 训练会写：
 
@@ -421,15 +431,28 @@ OUTPUT_DIR/
 
 export 含 drafter、冻结 `embed_tokens`、冻结 `lm_head` 和 checksum。它证明训练产物完整，
 不自动证明某个推理框架已经认识其 GLM config、attention、Markov/confidence 或 DFlash2
-selector。
+selector。新 export 的 schema 是 `glm-drafter-speculator-export-v2`，初始状态必须为
+`candidate-not-deployable`。
 
 本地模型代码借用 `Qwen3Config` 作为配置容器并实现固定的 GLM draft shape；这不表示
 目标是 Qwen，也不表示 GLM runtime 会自动把 `model_type=qwen3` 当成正确 proposer。
 serving adapter 必须显式完成 config/state 映射，不能仅靠 `trust_remote_code` 碰运气。
 
-截至本文日期，vLLM-Ascend 官方 speculative decoding 文档虽已有 DFlash/DSpark 入口，
-但明确注明 DSpark 当前只支持 Qwen，GLM/DeepSeek 仍在逐步适配。官方 Speculators 文档
-存在 GLM-5.2 DSpark preview，并不等于所用 Ascend 版本已经完成 GLM 适配。因此：
+三种方法的 export 已经拆开：
+
+- `src/glm_dflash2/vllm_ascend/export_dflash.py`：DFlash B8/B16；
+- `src/glm_dflash2/vllm_ascend/export_dspark.py`：DSpark B8，公开 Markov/confidence key
+  通过结构 ABI fixture 校验；fixture 中的 runtime commit 目前仍是
+  `PIN_ON_ASCEND_HOST`，到服务器后必须替换为实际验证的 commits；
+- `src/glm_dflash2/vllm_ascend/export_dflash2.py`：DFlash2 B8/B16；
+- `integrations/vllm_ascend/`：DFlash2 独立 runtime adapter，禁止伪装成 DFlash。
+
+候选 manifest 绑定 config、weights、target I/O、模型/tokenizer identity、hidden layers、
+block/proposal/anchor 语义和方法超参。任何字节变化都会改变 candidate hash。legacy v1
+只允许诊断，永远不能生成 deploy attestation。
+
+截至本文日期，vLLM-Ascend/Speculators 对具体 GLM-5.2 fork 的支持仍必须以目标服务器的
+真实 commit 和运行结果为准。因此：
 
 - DFlash：需要在目标 vLLM-Ascend/厂商 fork 验证 GLM-5.2 draft config 和 proposer；
 - DFlash2：需要 method-specific proposer/selector adapter；不能伪装成普通 DFlash；
@@ -441,11 +464,14 @@ serving adapter 必须显式完成 config/state 映射，不能仅靠 `trust_rem
 - <https://github.com/vllm-project/speculators/blob/main/docs/user_guide/algorithms/dspark.md>
 - <https://github.com/vllm-project/vllm-ascend/pull/11066>
 
-服务器 AI 的首选策略不是另造模型，而是检查部署服务器正在使用的 vLLM-Ascend/SGLang
-fork 是否已经包含 GLM-5.2 DFlash/DSpark patch；若有，按其实际 config/key/forward ABI
-写 exporter adapter。若没有，在该 fork 内实现 proposer，并加 offline-vs-runtime parity。
+服务器 AI 的首选策略不是另造模型，而是检查部署服务器正在使用的 vLLM-Ascend
+fork 是否已经包含 GLM-5.2 DFlash/DSpark proposer；若有，验证当前 exporter 的实际
+config/key/forward ABI。若没有，在该 fork 内补 proposer。DFlash2 只在
+`integrations/vllm_ascend/` 适配，不能把 runtime 逻辑写回训练模型。
+`integrations/vllm_ascend/apply_patch.sh` 会在 `VERSION` 仍含
+`PIN_ON_ASCEND_HOST` 时主动拒绝安装；这是安全 gate，不是可绕过的 TODO。
 
-## 10. Runtime parity 与最终评测
+## 10. Runtime parity、attestation 与最终评测
 
 在启动大 benchmark 前，用固定短 batch 对比 offline 与 runtime：
 
@@ -453,6 +479,27 @@ fork 是否已经包含 GLM-5.2 DFlash/DSpark patch；若有，按其实际 conf
 - DFlash2：base top-16 candidate IDs/scores、selector scores；
 - DSpark：Markov chunk scores、confidence logits；
 - greedy verify：最终输出必须与 target-only 逐 token 相同。
+
+此外必须验证：candidate 能加载；标准 rejection sampling 启用；
+`num_drafts/draft_tokens/accepted_tokens` counter delta 为正。parity JSON 的 schema 必须是
+`glm-vllm-ascend-parity-results-v1`，并绑定 candidate hash 和完整 runtime identity：
+vLLM/vLLM-Ascend/Speculators 的 version+commit、adapter revision、CANN、torch-npu、
+driver、firmware、device/backend/runner、TP/EP/PP/DP/节点数以及 graph/chunked
+prefill/prefix cache 状态。生产配置默认要求 PP=DP=1，并关闭 graph、chunked prefill 和
+prefix cache，避免把未验证的调度差异混入 parity。
+
+真实 runtime parity 全部通过后执行：
+
+```bash
+PYTHONPATH=src python tools/attest_vllm_ascend_export.py attest \
+  --export /shared/out/glm52-dspark-b8/export \
+  --runtime-identity /shared/identity/vllm-ascend-runtime.json \
+  --parity-results /shared/gate/dspark-parity-results.json
+```
+
+它才会生成 `deploy_attestation.json` 并把 manifest 状态改为 `runtime-attested`。禁止手工
+改状态。评测入口会重新采集 active runtime；candidate bytes 或 runtime 任一漂移都会
+在加载 target 前失败。
 
 当前评测入口：
 
@@ -475,13 +522,15 @@ speedup = speculative TPS / target-only TPS
 ```bash
 TARGET_MODEL=/shared/models/GLM-5.2-bf16 \
 DRAFTER_EXPORT=/shared/out/glm52-dspark-b8/export \
-PROMPTS_JSONL=/shared/eval/fixed-prompts.jsonl \
+PROMPTS=/shared/eval/fixed-prompts.jsonl \
 OUT_DIR=/shared/eval/glm52-dspark-b8 \
 TP_SIZE=16 MAX_SAMPLES=100 MAX_TOKENS=2048 \
 bash scripts/eval_vllm_ascend.sh
 ```
 
-注意：该 launcher 当前只会设置单节点可见设备并启动一个本地 `vllm serve`。GLM-5.2
+注意：formal greedy parity 依赖 pinned vLLM response extension 返回 raw completion token
+IDs；只返回文本的 OpenAI API 不满足要求，不能用重 tokenize 代替。该 launcher 当前只会
+设置单节点可见设备并启动一个本地 `vllm serve`。GLM-5.2
 BF16 通常无法用示例 TP16 单节点承载；必须按服务器已工作的多节点 TP/EP 启动方式改造
 server launch 部分，benchmark client/compare 部分可以复用。不要因为脚本能 `bash -n`
 就声称多节点评测已经支持。
@@ -531,7 +580,9 @@ MASK/PAD、DSpark confidence 非退化、DFlash2 selector 有监督覆盖率。
 
 ### P7：runtime adapter + offline/runtime parity
 
-任何方法 parity 未过，都不能跑 TPS 主表。
+固定真实 runtime identity，分别生成方法级 parity JSON；任何 gate 未过都不能创建 deploy
+attestation，也不能跑 TPS 主表。DFlash2 必须额外验证 candidate top-k、dynamic-conv 和
+selector rerank。
 
 ### P8：串行 benchmark
 
@@ -574,17 +625,20 @@ rank 日志。不要反复改超参掩盖 adapter、position、dtype 或 distrib
 ## 14. 代码导航
 
 ```text
-Stage A        scripts/run_stage_a_trajectories.sh
+Stage A        scripts/generate_trajectories.sh
+               scripts/run_stage_a_trajectories.sh  # compatibility worker
                tools/generate_trajectories.py
                src/glm_dflash2/agent_trajectory.py
-Stage B        scripts/run_stage_b_hidden.sh
+Stage B        scripts/extract_hidden_sglang.sh
+               scripts/run_stage_b_hidden.sh        # compatibility worker
                tools/extract_hidden_sglang.py
                src/glm_dflash2/sglang_hidden_runner.py
 Cache          src/glm_dflash2/hidden_cache.py
 Parity         tools/calibrate_hidden_capture_gate.py
                tools/validate_hidden_cache.py
 Target I/O     scripts/extract_glm52_io.sh
-Training       scripts/train_glm52_drafter_910b.sh
+Training       scripts/train_drafter.sh
+               scripts/train_glm52_drafter_910b.sh  # compatibility worker
                tools/train_drafter_offline.py
                src/glm_dflash2/offline_trainer.py
 Models/loss    src/glm_dflash2/draft_backbone.py
@@ -592,7 +646,15 @@ Models/loss    src/glm_dflash2/draft_backbone.py
                src/glm_dflash2/dspark_model.py
                src/glm_dflash2/method_objectives.py
 Checkpoint     src/glm_dflash2/checkpointing.py
-Export         src/glm_dflash2/speculator_export.py
+Export         src/glm_dflash2/speculator_export.py  # compatibility facade
+               src/glm_dflash2/vllm_ascend/export_common.py
+               src/glm_dflash2/vllm_ascend/export_dflash.py
+               src/glm_dflash2/vllm_ascend/export_dflash2.py
+               src/glm_dflash2/vllm_ascend/export_dspark.py
+Runtime gate   tools/attest_vllm_ascend_export.py
+               src/glm_dflash2/vllm_ascend/capability.py
+               src/glm_dflash2/vllm_ascend/parity.py
+               integrations/vllm_ascend/
 Evaluation     scripts/eval_vllm_ascend.sh
                tools/benchmark_vllm_ascend.py
 Tests          tests/
