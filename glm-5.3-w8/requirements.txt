@@ -1,0 +1,4 @@
+# Install these only in the generic Python layer. Keep torch/torch-npu/CANN and
+# vLLM/vLLM-Ascend from one vendor-compatible Ascend image or environment.
+safetensors>=0.5.3
+pytest>=8.0
